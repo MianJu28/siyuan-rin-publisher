@@ -368,25 +368,37 @@ export default class RinPublisherPlugin extends Plugin {
     /**
      * 获取思源本地资源文件（图片）的二进制内容。
      *
+     * 按思源官方建议，通过内核 API `/api/file/getFile` 读取 data 目录下的文件，
+     * 而非自行调用 fs，避免数据同步时出现块丢失或云端损坏。
+     *
+     * 使用原生 fetch（相对路径，自动解析到当前思源内核服务）+ 内核 API Token，
+     * 直接以 Blob 形式获取二进制文件内容，规避 fetchPost 对二进制接口的限制。
+     *
      * 思源 `getBlockKramdown` 中本地图片通常以 `assets/xxx.png` 或 `/assets/xxx.png`
-     * 形式引用。此方法通过相对路径 `/assets/xxx.png` 读取图片，浏览器会自动解析
-     * 到当前思源内核服务的正确地址，无需拼接端口。
+     * 形式引用，而 `/api/file/getFile` 的 path 需以 `data/` 开头。
      *
      * @param path 资源文件路径，如 `assets/xxx.png`
      * @returns 文件 Blob；失败返回 null
      */
     private async fetchAssetFile(path: string): Promise<Blob | null> {
-        // 思源资源文件可通过相对路径 /assets/xxx.png 直接访问，
-        // 浏览器会自动解析到当前思源内核服务的正确地址，无需拼接端口。
-        // 示例：`assets/xxx.png` -> `/assets/xxx.png`
-        const relative = `/${path.replace(/^\/+/, "")}`;
-        const url = relative
-            .split("/")
-            .map((seg) => encodeURIComponent(seg))
-            .join("/");
+        // 归一化路径：`/assets/xxx.png` / `assets/xxx.png` -> `data/assets/xxx.png`
+        const normalized = `data/${path.replace(/^\/+/, "").replace(/^data\//, "")}`;
+
+        // 获取思源内核 API Token 用于认证
+        const token = (window as unknown as { siyuan?: { config?: { api?: { token?: string } } } })
+            .siyuan?.config?.api?.token;
 
         try {
-            const resp = await fetch(url);
+            const headers: Record<string, string> = { "Content-Type": "application/json" };
+            if (token) {
+                headers["Authorization"] = `Token ${token}`;
+            }
+            // 相对路径会自动解析到当前思源内核服务，无需拼接端口
+            const resp = await fetch("/api/file/getFile", {
+                method: "POST",
+                headers,
+                body: JSON.stringify({ path: normalized }),
+            });
             if (!resp.ok) {
                 console.warn(`[rin-publisher] get asset fail: ${path}`, resp.status);
                 return null;
