@@ -1,6 +1,7 @@
 node_modules/
 dist/
 package.zip
+*.zip
 index.js
 index.css
 i18n/

@@ -6,6 +6,11 @@ const MiniCssExtractPlugin = require("mini-css-extract-plugin");
 const CopyPlugin = require("copy-webpack-plugin");
 const ZipPlugin = require("zip-webpack-plugin");
 
+// 读取插件清单，用于生成带版本号的发布包文件名
+const pluginManifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "plugin.json"), "utf8"));
+const packageName = pluginManifest.name || "plugin";
+const packageVersion = pluginManifest.version || "0.0.0";
+
 module.exports = (env, argv) => {
     const production = argv.mode === "production";
     const plugins = [
@@ -32,7 +37,8 @@ module.exports = (env, argv) => {
         );
         plugins.push(
             new ZipPlugin({
-                filename: "package.zip",
+                path: "dist/package",
+                filename: `${packageName}-${packageVersion}.zip`,
                 algorithm: "gzip",
                 include: [/dist/],
                 pathMapper: (assetPath) => assetPath.replace("dist/", ""),
