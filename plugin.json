@@ -38,8 +38,8 @@
     "zh-CN": "Rin 发布"
   },
   "description": {
-    "default": "Publish notes from SiYuan to Rin blog",
-    "zh-CN": "将思源笔记发布到 Rin 博客"
+    "default": "Publish current SiYuan note to Rin blog: auto-upload local images, custom publish options (public/draft/tags/summary/alias), one-click publish and update.",
+    "zh-CN": "将思源笔记一键发布到 Rin 博客：自动上传并替换本地图片，支持自定义发布（公开/草稿/标签/简介/别名），一键发布与更新。"
   },
   "readme": {
     "default": "README.md",
