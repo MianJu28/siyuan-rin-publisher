@@ -19,6 +19,8 @@
   "loginFailed": "Rin login failed",
   "publishing": "Publishing...",
   "updating": "Updating...",
+  "uploadingImages": "Uploading document images...",
+  "imagesUploadFailed": "{failed} image(s) failed to upload. Please check and retry",
   "networkError": "Network error",
   "settings": "Rin Publisher Settings",
   "settingBaseUrl": "Rin Site URL",

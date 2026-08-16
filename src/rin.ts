@@ -48,6 +48,11 @@ export interface RinApiError {
     value: string;
 }
 
+/** 图片上传结果 */
+export interface RinUploadResult {
+    url: string;
+}
+
 /** 统一的 API 调用结果 */
 export interface RinResult<T> {
     data?: T;
@@ -114,8 +119,7 @@ async function request<T>(
             message = value;
         } else {
             const obj = value as Record<string, unknown>;
-            message =
-                String(obj?.message ?? obj?.error ?? JSON.stringify(value));
+            message = String(obj?.message ?? obj?.error ?? JSON.stringify(value));
         }
         return { error: { status: response.status, value: message } };
     }
@@ -230,6 +234,68 @@ export class RinClient {
             `/api/feed/${id}`,
             this.token ?? undefined,
         );
+    }
+
+    /**
+     * 上传图片到 Rin 存储。
+     * 使用 multipart/form-data 提交文件，需要已登录（携带 token）。
+     * 参考 Rin API：POST /api/storage（字段 key + file）。
+     *
+     * @param file     图片文件（Blob/File）
+     * @param filename 文件名（含扩展名，用于生成存储后缀）
+     * @returns 上传后的图片访问 URL
+     */
+    async uploadImage(file: Blob, filename: string): Promise<RinResult<RinUploadResult>> {
+        const form = new FormData();
+        form.append("key", filename);
+        form.append("file", file, filename);
+
+        const headers: Record<string, string> = {};
+        if (this.token) {
+            headers["Authorization"] = `Bearer ${this.token}`;
+        }
+
+        let response: Response;
+        try {
+            response = await fetch(`${this.baseUrl}/api/storage`, {
+                method: "POST",
+                headers,
+                body: form,
+            });
+        } catch (e) {
+            return {
+                error: {
+                    status: 0,
+                    value: e instanceof Error ? e.message : "Network error",
+                },
+            };
+        }
+
+        if (!response.ok) {
+            let value: string = response.statusText;
+            try {
+                const text = await response.text();
+                try {
+                    const parsed = JSON.parse(text);
+                    value = String(parsed?.message ?? parsed?.error ?? text);
+                } catch {
+                    value = text;
+                }
+            } catch {
+                /* ignore */
+            }
+            return { error: { status: response.status, value } };
+        }
+
+        try {
+            const data = (await response.json()) as { url?: string };
+            if (!data?.url) {
+                return { error: { status: 200, value: "Invalid upload response" } };
+            }
+            return { data: { url: data.url } };
+        } catch {
+            return { error: { status: 200, value: "Invalid upload response" } };
+        }
     }
 
     /** 清除缓存的 token */

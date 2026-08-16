@@ -366,6 +366,183 @@ export default class RinPublisherPlugin extends Plugin {
     }
 
     /**
+     * 获取思源本地资源文件（图片）的二进制内容。
+     *
+     * 思源 `getBlockKramdown` 中本地图片通常以 `assets/xxx.png` 或 `/assets/xxx.png`
+     * 形式引用。此方法通过相对路径 `/assets/xxx.png` 读取图片，浏览器会自动解析
+     * 到当前思源内核服务的正确地址，无需拼接端口。
+     *
+     * @param path 资源文件路径，如 `assets/xxx.png`
+     * @returns 文件 Blob；失败返回 null
+     */
+    private async fetchAssetFile(path: string): Promise<Blob | null> {
+        // 思源资源文件可通过相对路径 /assets/xxx.png 直接访问，
+        // 浏览器会自动解析到当前思源内核服务的正确地址，无需拼接端口。
+        // 示例：`assets/xxx.png` -> `/assets/xxx.png`
+        const relative = `/${path.replace(/^\/+/, "")}`;
+        const url = relative
+            .split("/")
+            .map((seg) => encodeURIComponent(seg))
+            .join("/");
+
+        try {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                console.warn(`[rin-publisher] get asset fail: ${path}`, resp.status);
+                return null;
+            }
+            return await resp.blob();
+        } catch (e) {
+            console.warn("[rin-publisher] fetch asset fail:", e);
+            return null;
+        }
+    }
+
+    /**
+     * 处理文档 Markdown 中的图片。
+     *
+     * 检测所有 Markdown 图片 `![alt](url)`，若 url 指向思源本地资源
+     * （非 `http(s)://` 或 `data:` 形式，即未以链接形式引入），
+     * 则通过思源读取图片二进制，上传到 Rin，并将原链接替换为上传后的图片 URL。
+     *
+     * @param content 已清理的 Markdown 内容
+     * @param client  已登录的 Rin 客户端
+     * @returns 处理结果：处理后的内容、替换映射（原图片路径 -> 新 URL）与失败统计
+     */
+    private async processImages(
+        content: string,
+        client: RinClient,
+    ): Promise<{
+        content: string;
+        mapping: Map<string, string>;
+        total: number;
+        failed: number;
+    }> {
+        // 匹配 Markdown 图片语法：![alt](url) 或 ![alt](url "title")
+        const imageRegex = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g;
+        const matches: Array<{ full: string; alt: string; url: string }> = [];
+        let m: RegExpExecArray | null;
+        while ((m = imageRegex.exec(content)) !== null) {
+            matches.push({ full: m[0], alt: m[1], url: m[2] });
+        }
+
+        const mapping = new Map<string, string>();
+
+        // 收集需要上传的本地图片（跳过已是链接的）
+        const pending: Array<{ full: string; alt: string; url: string; filename: string }> = [];
+        for (const img of matches) {
+            const url = img.url.trim();
+            if (/^(https?:\/\/|data:|blob:)/i.test(url)) {
+                continue;
+            }
+            pending.push({
+                full: img.full,
+                alt: img.alt,
+                url,
+                filename: url.split(/[/\\]/).pop() || "image.png",
+            });
+        }
+
+        // 并发上传所有图片：读取图片 -> 上传到 Rin -> 得到新 URL
+        const results = await Promise.all(
+            pending.map(async (img) => {
+                try {
+                    const blob = await this.fetchAssetFile(img.url);
+                    if (!blob) {
+                        console.warn(`[rin-publisher] skip image, cannot read: ${img.url}`);
+                        return { full: img.full, alt: img.alt, url: img.url, newUrl: undefined };
+                    }
+                    const result = await client.uploadImage(blob, img.filename);
+                    if (result.error || !result.data?.url) {
+                        console.warn(`[rin-publisher] upload image fail: ${img.url}`, result.error?.value);
+                        return { full: img.full, alt: img.alt, url: img.url, newUrl: undefined };
+                    }
+                    return { full: img.full, alt: img.alt, url: img.url, newUrl: result.data.url };
+                } catch (e) {
+                    console.warn(`[rin-publisher] upload image error: ${img.url}`, e);
+                    return { full: img.full, alt: img.alt, url: img.url, newUrl: undefined };
+                }
+            }),
+        );
+
+        // 上传完成后统一替换链接，并记录映射
+        let failed = 0;
+        for (const r of results) {
+            if (!r.newUrl) {
+                failed++;
+                continue;
+            }
+            content = content.split(r.full).join(`![${r.alt}](${r.newUrl})`);
+            mapping.set(r.url.replace(/^\/+/, ""), r.newUrl);
+        }
+
+        return { content, mapping, total: matches.length, failed };
+    }
+
+    /**
+     * 更新文档中的图片块：把本地图片（引用 assets 资源）替换为上传后的线上链接。
+     *
+     * 遍历文档所有子块，图片块在 getChildBlocks 中 type 可能是 "p"（段落），
+     * 但其 markdown 字段为 Markdown 图片语法 `![alt](assets/xxx.png)`。
+     * 据此匹配替换映射，用 `/api/block/updateBlock` 将块更新为新的线上 URL。
+     *
+     * @param rootId  文档根块 ID
+     * @param mapping 原图片路径 -> 新 URL 的替换映射
+     */
+    private async updateDocImages(rootId: string, mapping: Map<string, string>): Promise<void> {
+        // 递归收集所有子块，筛选包含 Markdown 图片语法的块
+        const imgBlocks: Array<{ id: string; src: string; alt: string }> = [];
+
+        const collect = (parentId: string): Promise<void> =>
+            new Promise<void>((resolve) => {
+                fetchPost(
+                    "/api/block/getChildBlocks",
+                    { id: parentId },
+                    (resp: { data?: Array<{ id: string; markdown?: string }> }) => {
+                        const blocks = resp.data ?? [];
+                        const tasks: Promise<void>[] = [];
+                        for (const block of blocks) {
+                            // 图片块的 markdown 字段形如：![alt](assets/xxx.png)
+                            const m = /!\[([^\]]*)\]\(([^)\s]+)\)/.exec(block.markdown ?? "");
+                            if (m && m[2]) {
+                                const src = m[2].replace(/^\/+/, "");
+                                // 仅当该路径在替换映射中才记录，避免不必要更新
+                                if (mapping.has(src)) {
+                                    imgBlocks.push({ id: block.id, src, alt: m[1] ?? "" });
+                                }
+                            }
+                            // 递归子块
+                            tasks.push(collect(block.id));
+                        }
+                        Promise.all(tasks).then(() => resolve());
+                    },
+                    {},
+                    () => resolve(),
+                );
+            });
+
+        await collect(rootId);
+
+        // 逐个更新匹配的图片块
+        for (const img of imgBlocks) {
+            const newUrl = mapping.get(img.src);
+            if (!newUrl) {
+                continue;
+            }
+            const markdown = `![${img.alt}](${newUrl})`;
+            await new Promise<void>((resolve) => {
+                fetchPost(
+                    "/api/block/updateBlock",
+                    { id: img.id, dataType: "markdown", data: markdown },
+                    () => resolve(),
+                    {},
+                    () => resolve(),
+                );
+            });
+        }
+    }
+
+    /**
      * 获取当前文档的发布元信息（标题 + Markdown 内容 + 自定义属性）
      */
     private async collectPublishMeta(): Promise<PublishMeta | null> {
@@ -558,6 +735,23 @@ export default class RinPublisherPlugin extends Plugin {
             }
         }
 
+        // 发布前处理文档中的本地图片：检测非链接形式的图片，
+        // 通过 Rin 上传并替换为图片链接
+        let imageMapping: Map<string, string> = new Map();
+        try {
+            if (/!\[[^\]]*\]\([^)\s]+\)/.test(meta.content)) {
+                showMessage(this.i18n.uploadingImages);
+            }
+            const imgResult = await this.processImages(meta.content, client);
+            meta.content = imgResult.content;
+            imageMapping = imgResult.mapping;
+            if (imgResult.failed > 0) {
+                showMessage(this.i18n.imagesUploadFailed.replace("{failed}", String(imgResult.failed)));
+            }
+        } catch (e) {
+            console.warn("[rin-publisher] process images fail:", e);
+        }
+
         const rootId = this.getEditorProtyle()?.block.rootID;
         let resultId: number | undefined;
         let isUpdate = false;
@@ -646,6 +840,15 @@ export default class RinPublisherPlugin extends Plugin {
             }
             resultId = res.data.insertedId;
             showMessage(this.i18n.publishSuccess);
+        }
+
+        // 发布成功后，将文档中的本地图片一并替换为上传后的线上链接
+        if (rootId && imageMapping.size > 0) {
+            try {
+                await this.updateDocImages(rootId, imageMapping);
+            } catch (e) {
+                console.warn("[rin-publisher] update doc images fail:", e);
+            }
         }
 
         // 将文章 id 写回文档自定义属性，便于后续更新 / 复制链接。

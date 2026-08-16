@@ -19,6 +19,8 @@
   "loginFailed": "Rin 登录失败",
   "publishing": "正在发布...",
   "updating": "正在更新...",
+  "uploadingImages": "正在上传文档图片...",
+  "imagesUploadFailed": "有 {failed} 张图片上传失败，请检查后重试",
   "networkError": "网络错误",
   "settings": "Rin 发布设置",
   "settingBaseUrl": "Rin 站点地址",
