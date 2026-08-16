@@ -42,8 +42,7 @@
     "zh-CN": "将思源笔记一键发布到 Rin 博客：自动上传并替换本地图片，支持自定义发布（公开/草稿/标签/简介/别名），一键发布与更新。"
   },
   "readme": {
-    "default": "README.md",
-    "zh-CN": "README.zh-CN.md"
+    "default": "README.md"
   },
   "funding": {
     "openCollective": "",
