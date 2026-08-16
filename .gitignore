@@ -1,0 +1,9 @@
+node_modules/
+dist/
+package.zip
+index.js
+index.css
+i18n/
+kernel.js
+*.log
+.codebuddy/

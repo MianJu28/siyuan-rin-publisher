@@ -1,0 +1,60 @@
+{
+  "name": "siyuan-rin-publisher",
+  "author": "MianJu",
+  "url": "https://github.com/MianJu28/siyuan-rin-publisher",
+  "version": "0.2.1",
+  "minAppVersion": "3.1.0",
+  "kernels": [
+    "windows",
+    "linux",
+    "darwin",
+    "ios",
+    "android",
+    "harmony",
+    "docker",
+    "all"
+  ],
+  "backends": [
+    "windows",
+    "linux",
+    "darwin",
+    "ios",
+    "android",
+    "harmony",
+    "docker",
+    "all"
+  ],
+  "frontends": [
+    "desktop",
+    "mobile",
+    "browser-desktop",
+    "browser-mobile",
+    "desktop-window",
+    "all"
+  ],
+  "disabledInPublish": false,
+  "displayName": {
+    "default": "Rin Publisher",
+    "zh-CN": "Rin 发布"
+  },
+  "description": {
+    "default": "Publish notes from SiYuan to Rin blog",
+    "zh-CN": "将思源笔记发布到 Rin 博客"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh-CN": "README.zh-CN.md"
+  },
+  "funding": {
+    "openCollective": "",
+    "patreon": "",
+    "github": "",
+    "custom": []
+  },
+  "keywords": [
+    "rin",
+    "publisher",
+    "博客发布",
+    "blog publishing"
+  ]
+}

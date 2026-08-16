@@ -1,0 +1,43 @@
+.rin-publisher__setting {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+
+    .b3-form__item {
+        margin: 0;
+    }
+
+    .b3-form__label {
+        min-width: 120px;
+        margin-right: 8px;
+        align-items: center;
+    }
+}
+
+.rin-publisher__publish {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+
+    .b3-form__item {
+        margin: 0;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 6px;
+    }
+
+    .b3-form__label {
+        margin: 0;
+    }
+
+    .rin-publisher__publish-checkbox {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+    }
+
+    textarea.b3-text-field {
+        resize: vertical;
+        min-height: 72px;
+    }
+}
