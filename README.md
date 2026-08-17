@@ -1,4 +1,4 @@
-# siyuan-plugin-rin-publisher
+# siyuan-rin-publisher
 
 将思源笔记（SiYuan）中打开的文档一键发布到 [Rin](https://docs.openrin.org/) 博客。
 
@@ -22,11 +22,11 @@
 
 ## 安装
 
-1. 下载 `siyuan-plugin-rin-publisher-<版本号>.zip`（从 Release 或本仓库构建产物获取）。
+1. 下载 `siyuan-rin-publisher-<版本号>.zip`（从 Release 或本仓库构建产物获取）。
 2. 在思源笔记中：`设置 → 集市 → 插件`，点击"导入"并选择压缩包。
 3. 启用插件，在 `插件设置` 中填写 Rin 站点地址、用户名（管理员）、密码，并按需开启"自定义发布"。
 
-> 手动开发模式安装：将本项目克隆到 `工作空间/data/plugins/siyuan-plugin-rin-publisher`，然后执行 `npm install && npm run dev`。
+> 手动开发模式安装：将本项目克隆到 `工作空间/data/plugins/siyuan-rin-publisher`，然后执行 `npm install && npm run dev`。
 
 ## 使用
 
@@ -74,7 +74,7 @@ npm install
 # 开发模式（监听文件变化）
 npm run dev
 
-# 生产构建（生成 dist/ 与 dist/package/siyuan-plugin-rin-publisher-<版本号>.zip）
+# 生产构建（生成 dist/ 与 dist/package/siyuan-rin-publisher-<版本号>.zip）
 npm run build
 ```
 
