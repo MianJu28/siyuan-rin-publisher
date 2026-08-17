@@ -36,11 +36,15 @@ jobs:
           # 从 plugin.json 读取插件名与版本，构造带版本号的 zip 文件名
           NAME=$(node -p "require('./plugin.json').name")
           VERSION=$(node -p "require('./plugin.json').version")
-          ZIP_FILE="dist/package/${NAME}-${VERSION}.zip"
-          echo "Staging package: ${ZIP_FILE}"
+          VERSIONED_ZIP="dist/package/${NAME}-${VERSION}.zip"
+          # 上传至 Release 的产物统一命名为 package.zip
+          RELEASE_ZIP="dist/package/package.zip"
+          echo "Versioned package: ${VERSIONED_ZIP}"
           ls -la dist/package
-          test -f "${ZIP_FILE}" && echo "zip generated: ${ZIP_FILE}"
-          echo "zip_file=${ZIP_FILE}" >> "$GITHUB_ENV"
+          test -f "${VERSIONED_ZIP}" && echo "zip generated: ${VERSIONED_ZIP}"
+          cp "${VERSIONED_ZIP}" "${RELEASE_ZIP}"
+          echo "release zip staged: ${RELEASE_ZIP}"
+          echo "zip_file=${RELEASE_ZIP}" >> "$GITHUB_ENV"
 
       - name: Write release notes
         shell: bash
