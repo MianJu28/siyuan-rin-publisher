@@ -48,5 +48,17 @@
   "publishDialogSummary": "Summary",
   "publishDialogSummaryPh": "Article summary (optional)",
   "publishDialogSubmit": "Publish",
-  "publishDialogUpdate": "Update"
+  "publishDialogUpdate": "Update",
+  "deletedConfirmTitle": "Article deleted",
+  "deletedConfirmDesc": "The article published to Rin has been deleted and cannot be updated. Choose to republish (create a new article) or cancel publish (clear the local publish record).",
+  "republish": "Republish",
+  "unpublish": "Cancel publish",
+  "unpublishedSuccess": "Publish cancelled and the local publish record has been cleared",
+  "unpublishFromRin": "Delete from Rin",
+  "unpublishConfirmTitle": "Cancel publish",
+  "unpublishConfirmDesc": "Are you sure you want to delete this article from Rin? This action cannot be undone. The local publish record will also be cleared.",
+  "unpublishDeleting": "Deleting article from Rin...",
+  "unpublishDeleteSuccess": "Article deleted from Rin and local publish record cleared",
+  "unpublishDeleteFailed": "Failed to delete article from Rin",
+  "unpublishConfirmAction": "Confirm delete"
 }

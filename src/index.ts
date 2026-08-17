@@ -259,6 +259,13 @@ export default class RinPublisherPlugin extends Plugin {
                 this.copyCurrentDocLink().catch((e) => console.error(e));
             },
         });
+        menu.addItem({
+            icon: "iconTrashcan",
+            label: this.i18n.unpublishFromRin,
+            click: () => {
+                this.unpublishCurrentDoc().catch((e) => console.error(e));
+            },
+        });
         menu.addSeparator();
         menu.addItem({
             icon: "iconCheck",
@@ -723,6 +730,162 @@ export default class RinPublisherPlugin extends Plugin {
     }
 
     /**
+     * 弹出「Rin 上文章已被删除」的确认对话框，让用户选择重新发布还是取消发布。
+     *
+     * @returns "republish" 表示重新发布（新建文章）；"unpublish" 表示取消发布（清除本地发布记录）；null 表示用户关闭对话框
+     */
+    private showDeletedConfirmDialog(): Promise<"republish" | "unpublish" | null> {
+        return new Promise((resolve) => {
+            const dialog = new Dialog({
+                title: this.i18n.deletedConfirmTitle,
+                content: `
+<div class="b3-dialog__content">
+    <div class="b3-typography">${this.i18n.deletedConfirmDesc}</div>
+</div>
+<div class="b3-dialog__action">
+    <button class="b3-button b3-button--cancel" id="rinDelUnpublish">${this.i18n.unpublish}</button>
+    <div class="fn__space"></div>
+    <button class="b3-button b3-button--text" id="rinDelRepublish">${this.i18n.republish}</button>
+</div>`,
+                width: this.isMobile ? "92vw" : "520px",
+            });
+
+            const unpublishBtn = dialog.element.querySelector("#rinDelUnpublish") as HTMLButtonElement;
+            const republishBtn = dialog.element.querySelector("#rinDelRepublish") as HTMLButtonElement;
+
+            unpublishBtn.addEventListener("click", () => {
+                dialog.destroy();
+                resolve("unpublish");
+            });
+            republishBtn.addEventListener("click", () => {
+                dialog.destroy();
+                resolve("republish");
+            });
+            // 点击遮罩关闭时视为取消（不执行任何操作）
+            dialog.element.addEventListener("click", (e) => {
+                if (e.target === dialog.element) {
+                    dialog.destroy();
+                    resolve(null);
+                }
+            });
+        });
+    }
+
+    /**
+     * 清除文档中与 Rin 发布相关的自定义属性（custom-rin-id / custom-rin-url）。
+     *
+     * @param rootId 文档根块 ID
+     */
+    private async clearPublishAttrs(rootId: string): Promise<void> {
+        const attrs: Record<string, string> = {
+            [ATTR_RIN_ID]: "",
+            [ATTR_RIN_URL]: "",
+        };
+        try {
+            await new Promise<void>((resolve) => {
+                fetchPost("/api/attr/setBlockAttrs", { id: rootId, attrs }, () => resolve());
+            });
+        } catch (e) {
+            console.warn("[rin-publisher] clear rin attrs fail:", e);
+        }
+    }
+
+    /**
+     * 弹出「取消发布」确认对话框，确认是否从 Rin 删除该文章。
+     *
+     * @returns true 表示确认删除；false 表示取消操作
+     */
+    private showUnpublishConfirmDialog(): Promise<boolean> {
+        return new Promise((resolve) => {
+            const dialog = new Dialog({
+                title: this.i18n.unpublishConfirmTitle,
+                content: `
+<div class="b3-dialog__content">
+    <div class="b3-typography">${this.i18n.unpublishConfirmDesc}</div>
+</div>
+<div class="b3-dialog__action">
+    <button class="b3-button b3-button--cancel" id="rinUnpubCancel">${this.i18n.cancel}</button>
+    <div class="fn__space"></div>
+    <button class="b3-button b3-button--text" id="rinUnpubConfirm">${this.i18n.unpublishConfirmAction}</button>
+</div>`,
+                width: this.isMobile ? "92vw" : "520px",
+            });
+
+            const cancelBtn = dialog.element.querySelector("#rinUnpubCancel") as HTMLButtonElement;
+            const confirmBtn = dialog.element.querySelector("#rinUnpubConfirm") as HTMLButtonElement;
+
+            const close = (result: boolean) => {
+                dialog.destroy();
+                resolve(result);
+            };
+
+            cancelBtn.addEventListener("click", () => close(false));
+            confirmBtn.addEventListener("click", () => close(true));
+            // 点击遮罩关闭时视为取消
+            dialog.element.addEventListener("click", (e) => {
+                if (e.target === dialog.element) {
+                    close(false);
+                }
+            });
+        });
+    }
+
+    /**
+     * 取消发布：从 Rin 删除当前文档对应的文章，并清除文档中的发布相关自定义属性。
+     */
+    private async unpublishCurrentDoc() {
+        const { baseUrl, username, password } = this.config;
+        const rootId = this.getEditorProtyle()?.block.rootID;
+        if (!rootId) {
+            showMessage(this.i18n.noDoc);
+            return;
+        }
+        if (!baseUrl) {
+            showMessage(this.i18n.noConfig);
+            return;
+        }
+
+        // 读取文档自定义属性，获取已发布的 Rin id
+        const attrs = await new Promise<Record<string, string>>((resolve) => {
+            fetchPost("/api/attr/getBlockAttrs", { id: rootId }, (resp: { data?: Record<string, string> }) => {
+                resolve(resp.data ?? {});
+            });
+        });
+        const rinId = Number(attrs[ATTR_RIN_ID]);
+        if (!Number.isNaN(rinId) && rinId > 0) {
+            // 存在已发布的文章 id，先确认删除
+            const confirmed = await this.showUnpublishConfirmDialog();
+            if (!confirmed) {
+                return;
+            }
+        }
+
+        // 登录获取 token
+        const client = new RinClient(baseUrl);
+        if (username) {
+            const login = await client.login(username, password);
+            if (!login.data?.token) {
+                showMessage(`${this.i18n.loginFailed}：${login.error?.value ?? ""}`);
+                return;
+            }
+        }
+
+        // 从 Rin 删除文章
+        if (!Number.isNaN(rinId) && rinId > 0) {
+            showMessage(this.i18n.unpublishDeleting);
+            const res = await client.deleteFeed(rinId);
+            if (res.error) {
+                showMessage(`${this.i18n.unpublishDeleteFailed}：${res.error.value}`);
+                return;
+            }
+        }
+
+        // 清除文档中的发布相关自定义属性
+        await this.clearPublishAttrs(rootId);
+        showMessage(this.i18n.unpublishDeleteSuccess);
+    }
+
+    /**
      * 发布（或更新）当前文档到 Rin
      */
     private async publishCurrentDoc() {
@@ -769,13 +932,26 @@ export default class RinPublisherPlugin extends Plugin {
         let isUpdate = false;
 
         // 存在 custom-rin-id 时，先校验 Rin 上该文章是否真实存在。
-        // 若文章已不存在（例如被删除，或 custom-rin-id 是残留/误判），
-        // 则降级为新建，避免误进入更新分支导致"文档已发布"误报。
+        // 若文章已不存在（例如在 Rin 上被删除，或 custom-rin-id 是残留/误判），
+        // 则弹出提醒，让用户选择"重新发布"（新建文章）还是"取消发布"（清除本地发布记录）。
         if (meta.rinId) {
             const feed = await client.getFeed(meta.rinId);
             if (feed.error && feed.error.status === 404) {
-                console.warn(`[rin-publisher] rin feed ${meta.rinId} not found, fallback to create`);
-                meta.rinId = undefined;
+                console.warn(`[rin-publisher] rin feed ${meta.rinId} not found`);
+                const choice = await this.showDeletedConfirmDialog();
+                if (choice === "unpublish" && rootId) {
+                    // 取消发布：清除文档中的发布相关自定义属性
+                    await this.clearPublishAttrs(rootId);
+                    showMessage(this.i18n.unpublishedSuccess);
+                    return;
+                }
+                if (choice === "republish") {
+                    // 重新发布：降级为新建文章
+                    meta.rinId = undefined;
+                } else {
+                    // 用户关闭了对话框，放弃本次发布
+                    return;
+                }
             } else {
                 isUpdate = true;
             }

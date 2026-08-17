@@ -48,5 +48,17 @@
   "publishDialogSummary": "简介",
   "publishDialogSummaryPh": "文章简介/摘要（可选）",
   "publishDialogSubmit": "发布",
-  "publishDialogUpdate": "更新"
+  "publishDialogUpdate": "更新",
+  "deletedConfirmTitle": "文章已删除",
+  "deletedConfirmDesc": "该文档已在 Rin 上发布的文章被删除，无法更新。请选择重新发布（新建文章）或取消发布（清除本地的发布记录）。",
+  "republish": "重新发布",
+  "unpublish": "取消发布",
+  "unpublishedSuccess": "已取消发布，并清除本地的发布记录",
+  "unpublishFromRin": "从 Rin 删除",
+  "unpublishConfirmTitle": "取消发布",
+  "unpublishConfirmDesc": "确定要从 Rin 删除该文章吗？此操作不可恢复。文档中的发布记录也会一并清除。",
+  "unpublishDeleting": "正在从 Rin 删除文章...",
+  "unpublishDeleteSuccess": "已从 Rin 删除文章，并清除本地发布记录",
+  "unpublishDeleteFailed": "从 Rin 删除文章失败",
+  "unpublishConfirmAction": "确认删除"
 }
