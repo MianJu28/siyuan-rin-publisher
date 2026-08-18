@@ -84,7 +84,8 @@ module.exports = (env, argv) => {
                     use: [
                         {
                             loader: "esbuild-loader",
-                            options: { target: "es6" },
+                            // 与 tsconfig 的 ES2017 目标对齐，并兼容现代语法（思源内核基于较新 Chromium）
+                            options: { target: "es2018" },
                         },
                     ],
                 },

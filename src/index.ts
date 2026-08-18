@@ -16,6 +16,38 @@ const CONFIG_KEY = "rin-config";
 const ATTR_RIN_ID = "custom-rin-id";
 const ATTR_RIN_URL = "custom-rin-url";
 
+/** 图片并发上传的最大并发数，避免触发 Rin 限流或浏览器连接数上限 */
+const IMAGE_UPLOAD_CONCURRENCY = 4;
+
+/**
+ * 获取思源内核 API Token。
+ * 思源未公开该结构，这里集中管理类型断言，便于版本升级时统一修改。
+ */
+function getSiyuanToken(): string | undefined {
+    return (window as unknown as { siyuan?: { config?: { api?: { token?: string } } } })
+        .siyuan?.config?.api?.token;
+}
+
+/**
+ * 以固定并发数映射异步操作，避免 Promise.all 一次性发起全部请求。
+ */
+async function mapWithConcurrency<T, R>(
+    items: T[],
+    limit: number,
+    fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) {
+            const i = next++;
+            results[i] = await fn(items[i]);
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
+
 interface RinPluginConfig {
     baseUrl: string;
     username: string;
@@ -77,6 +109,20 @@ export default class RinPublisherPlugin extends Plugin {
 
     /** 最近一次自定义发布对话框中用户输入，用于发布后写回文档属性 */
     private lastPublishInput: PublishInput | null = null;
+
+    /** 缓存已登录的 Rin 客户端，避免每次发布/取消发布都重新登录 */
+    private rinClient: RinClient | null = null;
+
+    /**
+     * 获取（或创建）Rin 客户端，并在 baseUrl 变化时重建。
+     * 客户端内部会缓存登录 token，减少重复登录的网络往返。
+     */
+    private getRinClient(baseUrl: string): RinClient {
+        if (!this.rinClient || this.rinClient.getUrl() !== baseUrl) {
+            this.rinClient = new RinClient(baseUrl);
+        }
+        return this.rinClient;
+    }
 
     /** 事件监听回调（保存引用以便卸载时移除） */
     private readonly onSwitchProtyle = (event: CustomEvent<{ protyle: IProtyle }>) => {
@@ -294,7 +340,7 @@ export default class RinPublisherPlugin extends Plugin {
             showMessage(this.i18n.noConfig);
             return;
         }
-        const client = new RinClient(baseUrl);
+        const client = this.getRinClient(baseUrl);
         const ok = await client.testConnection(username, password);
         if (ok) {
             showMessage(this.i18n.testConnectionSuccess);
@@ -320,6 +366,19 @@ export default class RinPublisherPlugin extends Plugin {
     }
 
     /**
+     * 以 Promise 方式调用思源内核 API（fetchPost 的回调式封装）。
+     * 统一处理成功 / 失败回调，避免失败时 Promise 永久挂起。
+     * 思源回调参数类型为 IWebSocketData，此处按调用方约定的响应结构做强转。
+     */
+    private apiPost<T>(url: string, data: object): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            fetchPost(url, data, (r) => resolve(r as unknown as T), {}, () =>
+                reject(new Error(`siyuan api error: ${url}`)),
+            );
+        });
+    }
+
+    /**
      * 清理思源 Kramdown 中的块级 / 行内 IAL（Inline Attribute List）元数据。
      *
      * `getBlockKramdown` 返回的内容会包含两类 IAL 属性：
@@ -335,19 +394,30 @@ export default class RinPublisherPlugin extends Plugin {
     private cleanKramdown(kramdown: string): string {
         const lines = kramdown.split("\n");
         let inCodeBlock = false;
+        let fenceMarker = "";
         const cleanedLines: string[] = [];
 
         for (const line of lines) {
-            // 检测代码围栏，切换代码块状态（` ``` ` 或 ` ~~~ `）
-            const fenceMatch = line.match(/^\s*(```+|~~~+)/);
-            if (fenceMatch) {
-                inCodeBlock = !inCodeBlock;
+            // 检测代码围栏并正确配对（按围栏类型，缩进的围栏视为代码内容而非围栏）。
+            // 未进入代码块时，围栏行必须顶格（无前导空白）才算开启，避免把缩进的代码内容误判为围栏。
+            const openingFence = !inCodeBlock ? /^(```+|~~~+)/.exec(line) : null;
+            if (openingFence) {
+                fenceMarker = openingFence[1];
+                inCodeBlock = true;
                 cleanedLines.push(line);
                 continue;
             }
 
-            // 代码块内的内容原样保留（其中的 {: } 可能是用户代码）
+            // 代码块内：用与开启围栏同类型的围栏（可带尾随空白）闭合
             if (inCodeBlock) {
+                const closingFence = new RegExp(`^${fenceMarker[0]}+\\s*$`).exec(line);
+                if (closingFence) {
+                    inCodeBlock = false;
+                    fenceMarker = "";
+                    cleanedLines.push(line);
+                    continue;
+                }
+                // 代码块内的其他内容原样保留（其中的 {: } 可能是用户代码）
                 cleanedLines.push(line);
                 continue;
             }
@@ -392,8 +462,12 @@ export default class RinPublisherPlugin extends Plugin {
         const normalized = `data/${path.replace(/^\/+/, "").replace(/^data\//, "")}`;
 
         // 获取思源内核 API Token 用于认证
-        const token = (window as unknown as { siyuan?: { config?: { api?: { token?: string } } } })
-            .siyuan?.config?.api?.token;
+        const token = getSiyuanToken();
+        if (!token) {
+            console.warn(
+                "[rin-publisher] 未获取到思源内核 API Token，本地图片可能无法读取。请检查思源版本兼容性。",
+            );
+        }
 
         try {
             const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -439,59 +513,63 @@ export default class RinPublisherPlugin extends Plugin {
     }> {
         // 匹配 Markdown 图片语法：![alt](url) 或 ![alt](url "title")
         const imageRegex = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g;
-        const matches: Array<{ full: string; alt: string; url: string }> = [];
+        const matches: Array<{ alt: string; url: string }> = [];
         let m: RegExpExecArray | null;
         while ((m = imageRegex.exec(content)) !== null) {
-            matches.push({ full: m[0], alt: m[1], url: m[2] });
+            matches.push({ alt: m[1], url: m[2].trim() });
         }
 
         const mapping = new Map<string, string>();
 
         // 收集需要上传的本地图片（跳过已是链接的）
-        const pending: Array<{ full: string; alt: string; url: string; filename: string }> = [];
+        const pending: Array<{ alt: string; url: string; filename: string }> = [];
         for (const img of matches) {
-            const url = img.url.trim();
-            if (/^(https?:\/\/|data:|blob:)/i.test(url)) {
+            if (/^(https?:\/\/|data:|blob:)/i.test(img.url)) {
                 continue;
             }
             pending.push({
-                full: img.full,
                 alt: img.alt,
-                url,
-                filename: url.split(/[/\\]/).pop() || "image.png",
+                url: img.url,
+                filename: img.url.split(/[/\\]/).pop() || "image.png",
             });
         }
 
-        // 并发上传所有图片：读取图片 -> 上传到 Rin -> 得到新 URL
-        const results = await Promise.all(
-            pending.map(async (img) => {
-                try {
-                    const blob = await this.fetchAssetFile(img.url);
-                    if (!blob) {
-                        console.warn(`[rin-publisher] skip image, cannot read: ${img.url}`);
-                        return { full: img.full, alt: img.alt, url: img.url, newUrl: undefined };
-                    }
-                    const result = await client.uploadImage(blob, img.filename);
-                    if (result.error || !result.data?.url) {
-                        console.warn(`[rin-publisher] upload image fail: ${img.url}`, result.error?.value);
-                        return { full: img.full, alt: img.alt, url: img.url, newUrl: undefined };
-                    }
-                    return { full: img.full, alt: img.alt, url: img.url, newUrl: result.data.url };
-                } catch (e) {
-                    console.warn(`[rin-publisher] upload image error: ${img.url}`, e);
-                    return { full: img.full, alt: img.alt, url: img.url, newUrl: undefined };
+        // 限并发上传所有图片：读取图片 -> 上传到 Rin -> 得到新 URL
+        const results = await mapWithConcurrency(pending, IMAGE_UPLOAD_CONCURRENCY, async (img) => {
+            try {
+                const blob = await this.fetchAssetFile(img.url);
+                if (!blob) {
+                    console.warn(`[rin-publisher] skip image, cannot read: ${img.url}`);
+                    return { url: img.url, newUrl: undefined };
                 }
-            }),
-        );
+                const result = await client.uploadImage(blob, img.filename);
+                if (result.error || !result.data?.url) {
+                    console.warn(`[rin-publisher] upload image fail: ${img.url}`, result.error?.value);
+                    return { url: img.url, newUrl: undefined };
+                }
+                return { url: img.url, newUrl: result.data.url };
+            } catch (e) {
+                console.warn(`[rin-publisher] upload image error: ${img.url}`, e);
+                return { url: img.url, newUrl: undefined };
+            }
+        });
 
-        // 上传完成后统一替换链接，并记录映射
+        // 上传完成后按匹配位置逐一替换链接，并记录映射。
+        // 用带 lastIndex 的正则原位替换：避免 split/join 在相同 url 多引用时语义不精确，
+        // 也避免带 title 的图片（![alt](url "title")）漏替换。
         let failed = 0;
         for (const r of results) {
             if (!r.newUrl) {
                 failed++;
                 continue;
             }
-            content = content.split(r.full).join(`![${r.alt}](${r.newUrl})`);
+            const pattern = /!\[([^\]]*)\]\(([^)\s]+)((?:\s+["'][^"']*["'])?)\)/g;
+            content = content.replace(pattern, (orig, alt, url, title) => {
+                if (url.trim() === r.url) {
+                    return `![${alt}](${r.newUrl}${title})`;
+                }
+                return orig;
+            });
             mapping.set(r.url.replace(/^\/+/, ""), r.newUrl);
         }
 
@@ -512,53 +590,46 @@ export default class RinPublisherPlugin extends Plugin {
         // 递归收集所有子块，筛选包含 Markdown 图片语法的块
         const imgBlocks: Array<{ id: string; src: string; alt: string }> = [];
 
-        const collect = (parentId: string): Promise<void> =>
-            new Promise<void>((resolve) => {
-                fetchPost(
-                    "/api/block/getChildBlocks",
-                    { id: parentId },
-                    (resp: { data?: Array<{ id: string; markdown?: string }> }) => {
-                        const blocks = resp.data ?? [];
-                        const tasks: Promise<void>[] = [];
-                        for (const block of blocks) {
-                            // 图片块的 markdown 字段形如：![alt](assets/xxx.png)
-                            const m = /!\[([^\]]*)\]\(([^)\s]+)\)/.exec(block.markdown ?? "");
-                            if (m && m[2]) {
-                                const src = m[2].replace(/^\/+/, "");
-                                // 仅当该路径在替换映射中才记录，避免不必要更新
-                                if (mapping.has(src)) {
-                                    imgBlocks.push({ id: block.id, src, alt: m[1] ?? "" });
-                                }
-                            }
-                            // 递归子块
-                            tasks.push(collect(block.id));
+        const collect = async (parentId: string): Promise<void> => {
+            const resp = await this.apiPost<{ data?: Array<{ id: string; markdown?: string }> }>(
+                "/api/block/getChildBlocks",
+                { id: parentId },
+            ).catch(() => ({ data: undefined }));
+            const blocks = resp.data ?? [];
+            await Promise.all(
+                blocks.map(async (block) => {
+                    // 图片块的 markdown 字段形如：![alt](assets/xxx.png)
+                    const m = /!\[([^\]]*)\]\(([^)\s]+)\)/.exec(block.markdown ?? "");
+                    if (m && m[2]) {
+                        const src = m[2].replace(/^\/+/, "");
+                        // 仅当该路径在替换映射中才记录，避免不必要更新
+                        if (mapping.has(src)) {
+                            imgBlocks.push({ id: block.id, src, alt: m[1] ?? "" });
                         }
-                        Promise.all(tasks).then(() => resolve());
-                    },
-                    {},
-                    () => resolve(),
-                );
-            });
+                    }
+                    // 递归子块
+                    await collect(block.id);
+                }),
+            );
+        };
 
         await collect(rootId);
 
-        // 逐个更新匹配的图片块
-        for (const img of imgBlocks) {
-            const newUrl = mapping.get(img.src);
-            if (!newUrl) {
-                continue;
-            }
-            const markdown = `![${img.alt}](${newUrl})`;
-            await new Promise<void>((resolve) => {
-                fetchPost(
-                    "/api/block/updateBlock",
-                    { id: img.id, dataType: "markdown", data: markdown },
-                    () => resolve(),
-                    {},
-                    () => resolve(),
-                );
-            });
-        }
+        // 并发更新匹配的图片块
+        await Promise.all(
+            imgBlocks.map(async (img) => {
+                const newUrl = mapping.get(img.src);
+                if (!newUrl) {
+                    return;
+                }
+                const markdown = `![${img.alt}](${newUrl})`;
+                await this.apiPost<void>("/api/block/updateBlock", {
+                    id: img.id,
+                    dataType: "markdown",
+                    data: markdown,
+                }).catch((e) => console.warn(`[rin-publisher] update block fail: ${img.id}`, e));
+            }),
+        );
     }
 
     /**
@@ -572,23 +643,19 @@ export default class RinPublisherPlugin extends Plugin {
         }
         const rootId = protyle.block.rootID;
 
-        // 获取文档标题（getBlockInfo 返回的文档标题字段为 rootTitle）
-        const title = await new Promise<string>((resolve) => {
-            fetchPost(
-                "/api/block/getBlockInfo",
-                { id: rootId },
-                (resp: { data?: { rootTitle?: string } }) => {
-                    resolve(resp.data?.rootTitle ?? "");
-                },
-            );
-        });
+        // 并行获取文档标题、Kramdown 内容与自定义属性（三者互不依赖）
+        const [titleResp, kramdownResp, attrsResp] = await Promise.all([
+            this.apiPost<{ data?: { rootTitle?: string } }>("/api/block/getBlockInfo", { id: rootId }),
+            this.apiPost<{ data?: { kramdown?: string } }>("/api/block/getBlockKramdown", { id: rootId }),
+            this.apiPost<{ data?: Record<string, string> }>("/api/attr/getBlockAttrs", { id: rootId }).catch(() => ({
+                data: undefined,
+            })),
+        ]);
+
+        const title = titleResp.data?.rootTitle ?? "";
 
         // 获取文档 Markdown（Kramdown）内容，并清理思源 IAL 元数据
-        const kramdown = await new Promise<string | null>((resolve) => {
-            fetchPost("/api/block/getBlockKramdown", { id: rootId }, (resp: { data?: { kramdown?: string } }) => {
-                resolve(resp.data?.kramdown ?? null);
-            });
-        });
+        const kramdown = kramdownResp.data?.kramdown ?? null;
         if (kramdown === null) {
             showMessage(this.i18n.getContentFailed);
             return null;
@@ -596,16 +663,7 @@ export default class RinPublisherPlugin extends Plugin {
         const content = this.cleanKramdown(kramdown);
 
         // 读取自定义属性（用于预填发布对话框中的默认值）
-        let attrs: Record<string, string> = {};
-        try {
-            attrs = await new Promise<Record<string, string>>((resolve) => {
-                fetchPost("/api/attr/getBlockAttrs", { id: rootId }, (resp: { data?: Record<string, string> }) => {
-                    resolve(resp.data ?? {});
-                });
-            });
-        } catch (e) {
-            console.warn("[rin-publisher] get attrs fail:", e);
-        }
+        const attrs = attrsResp.data ?? {};
 
         // 解析标签（从文档自定义属性 custom-tags 读取，逗号分隔）
         const tags: string[] = [];
@@ -782,9 +840,7 @@ export default class RinPublisherPlugin extends Plugin {
             [ATTR_RIN_URL]: "",
         };
         try {
-            await new Promise<void>((resolve) => {
-                fetchPost("/api/attr/setBlockAttrs", { id: rootId, attrs }, () => resolve());
-            });
+            await this.apiPost<void>("/api/attr/setBlockAttrs", { id: rootId, attrs });
         } catch (e) {
             console.warn("[rin-publisher] clear rin attrs fail:", e);
         }
@@ -846,13 +902,12 @@ export default class RinPublisherPlugin extends Plugin {
         }
 
         // 读取文档自定义属性，获取已发布的 Rin id
-        const attrs = await new Promise<Record<string, string>>((resolve) => {
-            fetchPost("/api/attr/getBlockAttrs", { id: rootId }, (resp: { data?: Record<string, string> }) => {
-                resolve(resp.data ?? {});
-            });
-        });
-        const rinId = Number(attrs[ATTR_RIN_ID]);
-        if (!Number.isNaN(rinId) && rinId > 0) {
+        const attrs = await this.apiPost<{ data?: Record<string, string> }>("/api/attr/getBlockAttrs", {
+            id: rootId,
+        }).catch(() => ({ data: undefined }));
+        const rinId = Number(attrs.data?.[ATTR_RIN_ID]);
+        const hasRinId = !Number.isNaN(rinId) && rinId > 0;
+        if (hasRinId) {
             // 存在已发布的文章 id，先确认删除
             const confirmed = await this.showUnpublishConfirmDialog();
             if (!confirmed) {
@@ -860,18 +915,16 @@ export default class RinPublisherPlugin extends Plugin {
             }
         }
 
-        // 登录获取 token
-        const client = new RinClient(baseUrl);
-        if (username) {
-            const login = await client.login(username, password);
-            if (!login.data?.token) {
-                showMessage(`${this.i18n.loginFailed}：${login.error?.value ?? ""}`);
-                return;
+        // 仅当确定要删除远端文章时才登录（无 rinId 时无需网络请求）
+        if (hasRinId) {
+            const client = this.getRinClient(baseUrl);
+            if (username) {
+                const login = await client.login(username, password);
+                if (!login.data?.token) {
+                    showMessage(`${this.i18n.loginFailed}：${login.error?.value ?? ""}`);
+                    return;
+                }
             }
-        }
-
-        // 从 Rin 删除文章
-        if (!Number.isNaN(rinId) && rinId > 0) {
             showMessage(this.i18n.unpublishDeleting);
             const res = await client.deleteFeed(rinId);
             if (res.error) {
@@ -900,8 +953,8 @@ export default class RinPublisherPlugin extends Plugin {
             return;
         }
 
-        // 登录获取 token
-        const client = new RinClient(baseUrl);
+        // 登录获取 token（复用缓存的客户端，避免重复登录）
+        const client = this.getRinClient(baseUrl);
         if (username) {
             const login = await client.login(username, password);
             if (!login.data?.token) {
@@ -972,8 +1025,10 @@ export default class RinPublisherPlugin extends Plugin {
                 listed: extra.listed,
                 draft: extra.draft,
                 tags: extra.tags,
-                createdAt: meta.createdAt,
             };
+            if (meta.createdAt) {
+                p.createdAt = meta.createdAt;
+            }
             if (extra.alias) {
                 p.alias = extra.alias;
             }
@@ -1056,9 +1111,7 @@ export default class RinPublisherPlugin extends Plugin {
                 attrs["custom-summary"] = this.lastPublishInput.summary;
             }
             try {
-                await new Promise<void>((resolve) => {
-                    fetchPost("/api/attr/setBlockAttrs", { id: rootId, attrs }, () => resolve());
-                });
+                await this.apiPost<void>("/api/attr/setBlockAttrs", { id: rootId, attrs });
             } catch (e) {
                 console.warn("[rin-publisher] save rin attrs fail:", e);
             }
@@ -1074,21 +1127,59 @@ export default class RinPublisherPlugin extends Plugin {
             showMessage(this.i18n.noDoc);
             return;
         }
-        const attrs = await new Promise<Record<string, string>>((resolve) => {
-            fetchPost("/api/attr/getBlockAttrs", { id: rootId }, (resp: { data?: Record<string, string> }) => {
-                resolve(resp.data ?? {});
-            });
-        });
-        const link = attrs[ATTR_RIN_URL];
+        const attrs = await this.apiPost<{ data?: Record<string, string> }>("/api/attr/getBlockAttrs", {
+            id: rootId,
+        }).catch(() => ({ data: undefined }));
+        const link = attrs.data?.[ATTR_RIN_URL];
         if (!link) {
             showMessage(this.i18n.notPublished);
             return;
         }
-        try {
-            await navigator.clipboard.writeText(link);
+        const copied = await this.copyTextToClipboard(link);
+        if (copied) {
             showMessage(this.i18n.linkCopied);
-        } catch {
+        } else {
             showMessage(this.i18n.linkCopyFailed);
+        }
+    }
+
+    /**
+     * 复制文本到剪贴板。
+     *
+     * 优先使用 `navigator.clipboard.writeText`（需要安全上下文 + 用户激活），
+     * 在思源桌面端 Electron 环境中该 API 常因权限/激活状态失败，因此
+     * 失败时回退到「临时 textarea + document.execCommand('copy')」方案，
+     * 该方案在思源渲染进程中稳定可用，不受剪贴板权限限制。
+     */
+    private async copyTextToClipboard(text: string): Promise<boolean> {
+        // 方案一：现代 Clipboard API
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch {
+            /* 回退到方案二 */
+        }
+
+        // 方案二：临时 textarea + execCommand（兼容思源桌面端）
+        try {
+            const textarea = document.createElement("textarea");
+            textarea.value = text;
+            // 隐藏且不触发滚动/焦点，避免页面跳动
+            textarea.style.position = "fixed";
+            textarea.style.opacity = "0";
+            textarea.style.pointerEvents = "none";
+            textarea.setAttribute("readonly", "");
+            document.body.appendChild(textarea);
+            textarea.select();
+            textarea.setSelectionRange(0, text.length);
+            const ok = document.execCommand("copy");
+            document.body.removeChild(textarea);
+            return ok;
+        } catch (e) {
+            console.warn("[rin-publisher] copy text fail:", e);
+            return false;
         }
     }
 }

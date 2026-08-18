@@ -6,15 +6,6 @@
  * 文章（Feed）创建/更新：POST /api/feed 与 POST /api/feed/:id。
  */
 
-export interface RinConfig {
-    /** Rin 站点地址，例如 https://your-blog.example.com */
-    baseUrl: string;
-    username: string;
-    password: string;
-    /** 是否启用自定义发布（发布时弹出对话框让用户选择选项） */
-    customPublish: boolean;
-}
-
 export interface RinFeedPayload {
     title: string;
     content: string;
@@ -67,6 +58,42 @@ function normalizeBaseUrl(url: string): string {
     return base;
 }
 
+/** 网络错误（请求未到达服务端）统一映射为 status 0 */
+function networkError(e: unknown): RinResult<never> {
+    return {
+        error: {
+            status: 0,
+            value: e instanceof Error ? e.message : "Network error",
+        },
+    };
+}
+
+/**
+ * 解析非 2xx 响应中的错误信息：优先取响应体的 JSON 的 message / error 字段，
+ * 其次取纯文本响应体，最后回退到 HTTP statusText。
+ */
+async function parseErrorResponse(response: Response, fallback: string): Promise<RinApiError> {
+    let value: unknown = fallback;
+    try {
+        const text = await response.text();
+        try {
+            value = JSON.parse(text);
+        } catch {
+            value = text;
+        }
+    } catch {
+        /* ignore，保留 fallback */
+    }
+    let message: string;
+    if (typeof value === "string") {
+        message = value;
+    } else {
+        const obj = value as Record<string, unknown>;
+        message = String(obj?.message ?? obj?.error ?? JSON.stringify(value));
+    }
+    return { status: response.status, value: message };
+}
+
 /**
  * 发起一次到 Rin 的请求。
  * 处理 JSON / 文本响应与错误信息提取。
@@ -94,34 +121,12 @@ async function request<T>(
             body: body !== undefined ? JSON.stringify(body) : undefined,
         });
     } catch (e) {
-        return {
-            error: {
-                status: 0,
-                value: e instanceof Error ? e.message : "Network error",
-            },
-        };
+        return networkError(e);
     }
 
     if (!response.ok) {
-        let value: unknown = response.statusText;
-        try {
-            const text = await response.text();
-            try {
-                value = JSON.parse(text);
-            } catch {
-                value = text;
-            }
-        } catch {
-            /* ignore */
-        }
-        let message: string;
-        if (typeof value === "string") {
-            message = value;
-        } else {
-            const obj = value as Record<string, unknown>;
-            message = String(obj?.message ?? obj?.error ?? JSON.stringify(value));
-        }
-        return { error: { status: response.status, value: message } };
+        const error = await parseErrorResponse(response, response.statusText);
+        return { error };
     }
 
     const contentType = response.headers.get("content-type") ?? "";
@@ -143,10 +148,6 @@ export class RinClient {
 
     getUrl(): string {
         return this.baseUrl;
-    }
-
-    isConfigured(): boolean {
-        return this.baseUrl.length > 0;
     }
 
     /**
@@ -263,38 +264,23 @@ export class RinClient {
                 body: form,
             });
         } catch (e) {
-            return {
-                error: {
-                    status: 0,
-                    value: e instanceof Error ? e.message : "Network error",
-                },
-            };
+            return networkError(e);
         }
 
         if (!response.ok) {
-            let value: string = response.statusText;
-            try {
-                const text = await response.text();
-                try {
-                    const parsed = JSON.parse(text);
-                    value = String(parsed?.message ?? parsed?.error ?? text);
-                } catch {
-                    value = text;
-                }
-            } catch {
-                /* ignore */
-            }
-            return { error: { status: response.status, value } };
+            const error = await parseErrorResponse(response, response.statusText);
+            return { error };
         }
 
         try {
             const data = (await response.json()) as { url?: string };
             if (!data?.url) {
-                return { error: { status: 200, value: "Invalid upload response" } };
+                // 应用层错误（HTTP 200 但响应不符合预期），用负数状态码区分于网络错误(0)
+                return { error: { status: -1, value: "Invalid upload response" } };
             }
             return { data: { url: data.url } };
         } catch {
-            return { error: { status: 200, value: "Invalid upload response" } };
+            return { error: { status: -1, value: "Invalid upload response" } };
         }
     }
 
