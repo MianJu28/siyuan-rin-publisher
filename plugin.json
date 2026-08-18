@@ -2,7 +2,7 @@
   "name": "siyuan-rin-publisher",
   "author": "MianJu",
   "url": "https://github.com/MianJu28/siyuan-rin-publisher",
-  "version": "0.4.2",
+  "version": "0.4.2.2",
   "minAppVersion": "3.1.0",
   "kernels": [
     "all"

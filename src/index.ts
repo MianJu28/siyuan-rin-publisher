@@ -10,10 +10,13 @@ import {
     Dialog,
 } from "siyuan";
 import { RinClient, RinFeedPayload } from "./rin";
+import { cleanKramdown } from "./kramdown";
 import {
     CredentialStore,
+    Environment,
     emptyCredentialStore,
-    isCryptoAvailable,
+    getEnvironment,
+    normalizeCredentialStore,
     readCredential,
     removeCredential,
     storeCredential,
@@ -24,6 +27,8 @@ const CONFIG_KEY = "rin-config";
 const CREDENTIAL_KEY = "rin-credential";
 const ATTR_RIN_ID = "custom-rin-id";
 const ATTR_RIN_URL = "custom-rin-url";
+/** 持久化本地图片路径 -> 线上 URL 的映射，避免「发布成功但文档块更新失败」时下次重复上传 */
+const ATTR_RIN_IMAGE_MAP = "custom-rin-image-map";
 
 /** 图片并发上传的最大并发数，避免触发 Rin 限流或浏览器连接数上限 */
 const IMAGE_UPLOAD_CONCURRENCY = 4;
@@ -35,6 +40,29 @@ const IMAGE_UPLOAD_CONCURRENCY = 4;
 function getSiyuanToken(): string | undefined {
     return (window as unknown as { siyuan?: { config?: { api?: { token?: string } } } })
         .siyuan?.config?.api?.token;
+}
+
+/**
+ * 对插入 HTML 模板字符串的文本进行转义，防止 XSS。
+ * 对话框 / 弹窗中若需拼接文档标题、链接等用户输入，必须经此函数转义后再插入。
+ */
+function escapeHtml(value: string | undefined | null): string {
+    return (value ?? "").replace(/[&<>"']/g, (c) => {
+        switch (c) {
+            case "&":
+                return "&amp;";
+            case "<":
+                return "&lt;";
+            case ">":
+                return "&gt;";
+            case '"':
+                return "&quot;";
+            case "'":
+                return "&#39;";
+            default:
+                return c;
+        }
+    });
 }
 
 /**
@@ -66,6 +94,8 @@ interface RinPluginConfig {
     tokenRef?: string;
     /** 指向 credential.json 中已持久化的密码密文的 id（JWT 失效时回退） */
     passwordRef?: string;
+    /** 是否已确认接受「非安全环境明文存储凭据」的风险（为 true 则发布时不再提示） */
+    dismissInsecureWarning?: boolean;
 }
 
 function defaultConfig(): RinPluginConfig {
@@ -127,6 +157,9 @@ export default class RinPublisherPlugin extends Plugin {
     /** 加密凭据存储（credential.json），与常规配置分离 */
     private credentialStore: CredentialStore = emptyCredentialStore();
 
+    /** 当前环境（决定读写 secure/insecure 分区） */
+    private credentialEnv: Environment = getEnvironment();
+
     /**
      * 获取（或创建）Rin 客户端，并在 baseUrl 变化时重建。
      * 客户端内部会缓存登录 token，减少重复登录的网络往返。
@@ -138,45 +171,103 @@ export default class RinPublisherPlugin extends Plugin {
         return this.rinClient;
     }
 
-    /** 加密是否可用（安全上下文） */
-    private get cryptoAvailable(): boolean {
-        return isCryptoAvailable();
+    /**
+     * 读取持久化的凭据（JWT 或密码），按当前环境分区读写。
+     *
+     * 跨环境回退/迁移：若当前环境分区中不存在该 id，则尝试从另一环境分区读取
+     * （例如 https 下读取 http 环境保存的明文凭据），并自动迁移到当前环境分区。
+     * 返回 `{ value, migrated }`，migrated 为 true 表示发生了跨环境读取。
+     */
+    private async readStoredCredential(
+        id: string | undefined,
+    ): Promise<{ value: string | null; migrated: boolean }> {
+        if (!id) {
+            return { value: null, migrated: false };
+        }
+        const env = this.credentialEnv;
+        const other: Environment = env === "secure" ? "insecure" : "secure";
+
+        let value = await readCredential(this.credentialStore, this.config.username, id, env);
+        if (value !== null) {
+            return { value, migrated: false };
+        }
+        // 当前环境无此凭据：尝试从另一环境读取（迁移场景）
+        value = await readCredential(this.credentialStore, this.config.username, id, other);
+        if (value !== null) {
+            return { value, migrated: true };
+        }
+        return { value: null, migrated: false };
     }
 
     /**
-     * 读取持久化的明文凭据（JWT 或密码）。
-     * 非安全上下文 / 解密失败时返回 null。
+     * 把凭据持久化到当前环境分区，并返回其 id。
+     * secure 分区 AES-GCM 加密；insecure 分区明文，返回 encrypted:false。
      */
-    private async readStoredCredential(id: string | undefined): Promise<string | null> {
-        if (!id || !this.cryptoAvailable) {
-            return null;
-        }
-        return readCredential(this.credentialStore, this.config.username, id);
-    }
-
-    /**
-     * 把凭据加密持久化到 credential.json，并返回其 id。
-     * 非安全上下文时返回 undefined（调用方应改用仅内存方案）。
-     */
-    private async persistCredential(plain: string): Promise<string | undefined> {
-        if (!this.cryptoAvailable) {
-            return undefined;
-        }
-        const id = await storeCredential(this.credentialStore, this.config.username, plain);
+    private async persistCredential(plain: string): Promise<{ id: string; encrypted: boolean } | undefined> {
+        const result = await storeCredential(this.credentialStore, this.config.username, plain, this.credentialEnv);
         await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
             console.warn("[rin-publisher] save credential fail:", e);
         });
-        return id;
+        return result;
     }
 
     /**
-     * 移除某个持久化凭据并落盘。
+     * 移除当前环境分区中的某个凭据并落盘。
      */
     private async removeStoredCredential(id: string | undefined): Promise<void> {
-        removeCredential(this.credentialStore, id);
+        removeCredential(this.credentialStore, id, this.credentialEnv);
         await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
             console.warn("[rin-publisher] save credential fail:", e);
         });
+    }
+
+    /**
+     * 处理跨环境迁移：把读取到的另一环境凭据写入当前环境分区，
+     * 并从原环境分区删除（可选）。调用方在读取返回 migrated 时调用。
+     */
+    private async migrateCredential(id: string | undefined, plain: string): Promise<string | undefined> {
+        if (!id) {
+            return undefined;
+        }
+        const env = this.credentialEnv;
+        const other: Environment = env === "secure" ? "insecure" : "secure";
+        // 写入当前环境分区
+        const result = await storeCredential(this.credentialStore, this.config.username, plain, env);
+        // 从原环境分区删除（迁移完成后清理）
+        removeCredential(this.credentialStore, id, other);
+        await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
+            console.warn("[rin-publisher] save credential fail:", e);
+        });
+        return result.id;
+    }
+
+    /**
+     * 清除所有明文凭据（insecure 分区）及配置中对它们的引用。
+     * 用于「使用 HTTPS 并清除明文配置」选项，避免明文继续残留。
+     */
+    private async clearInsecureCredentials(): Promise<void> {
+        // 清空 insecure 分区
+        this.credentialStore.insecure = {};
+        // 若配置引用指向 insecure 分区（当前环境即 insecure），一并清除引用
+        if (this.credentialEnv === "insecure") {
+            delete this.config.tokenRef;
+            delete this.config.passwordRef;
+        }
+        await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
+            console.warn("[rin-publisher] save credential fail:", e);
+        });
+    }
+
+    /**
+     * 把 http 地址转换为 https 地址（保留 host 与端口，仅替换协议）。
+     * 输入非 http 时原样返回。
+     */
+    private toHttpsUrl(url: string): string {
+        const trimmed = url.trim();
+        if (/^https:\/\//i.test(trimmed)) {
+            return trimmed;
+        }
+        return trimmed.replace(/^http:\/\//i, "https://");
     }
 
     /**
@@ -197,8 +288,16 @@ export default class RinPublisherPlugin extends Plugin {
 
         // 优先：复用持久化 JWT
         if (this.config.tokenRef) {
-            const jwt = await this.readStoredCredential(this.config.tokenRef);
+            const { value: jwt, migrated } = await this.readStoredCredential(this.config.tokenRef);
             if (jwt) {
+                if (migrated) {
+                    // 跨环境读取成功：迁移到当前环境分区
+                    const migratedId = await this.migrateCredential(this.config.tokenRef, jwt);
+                    if (migratedId) {
+                        this.config.tokenRef = migratedId;
+                        await this.saveData(CONFIG_KEY, this.config).catch(() => {});
+                    }
+                }
                 client.setToken(jwt);
                 const profile = await client.getProfile();
                 if (!profile.error) {
@@ -218,20 +317,31 @@ export default class RinPublisherPlugin extends Plugin {
 
         // 回退：使用持久化密码登录
         if (this.config.passwordRef) {
-            const password = await this.readStoredCredential(this.config.passwordRef);
+            const { value: password, migrated } = await this.readStoredCredential(this.config.passwordRef);
             if (!password) {
                 console.warn("[rin-publisher] stored password not decryptable");
                 return null;
+            }
+            if (migrated) {
+                const migratedId = await this.migrateCredential(this.config.passwordRef, password);
+                if (migratedId) {
+                    this.config.passwordRef = migratedId;
+                    await this.saveData(CONFIG_KEY, this.config).catch(() => {});
+                }
             }
             const login = await client.login(this.config.username, password);
             if (!login.data?.token) {
                 console.warn("[rin-publisher] login failed:", login.error?.value);
                 return null;
             }
-            // 登录成功：把新 JWT 加密持久化为 tokenRef，下次优先复用
-            const jwtId = await this.persistCredential(login.data.token);
-            if (jwtId) {
-                this.config.tokenRef = jwtId;
+            // 登录成功：把新 JWT 持久化为 tokenRef，下次优先复用
+            const jwtResult = await this.persistCredential(login.data.token);
+            if (jwtResult) {
+                this.config.tokenRef = jwtResult.id;
+                if (!jwtResult.encrypted) {
+                    // http 非 localhost：JWT 明文兜底，提示用户建议使用 https
+                    showMessage(this.i18n.httpsRecommended);
+                }
                 await this.saveData(CONFIG_KEY, this.config).catch(() => {});
             }
             return client;
@@ -265,11 +375,10 @@ export default class RinPublisherPlugin extends Plugin {
             console.warn(`[${this.name}] load config fail:`, e);
         });
 
-        // 加载加密凭据存储（与常规配置分离）
-        this.loadData(CREDENTIAL_KEY).then((store: CredentialStore | undefined) => {
-            if (store && typeof store === "object" && store.items) {
-                this.credentialStore = store;
-            }
+        // 加载加密凭据存储（与常规配置分离）。
+        // 旧版（v1）为单一 items 混合结构，加载时自动归一化为 secure/insecure 双分区。
+        this.loadData(CREDENTIAL_KEY).then((store: unknown) => {
+            this.credentialStore = normalizeCredentialStore(store);
         }).catch((e) => {
             console.warn(`[${this.name}] load credential fail:`, e);
         });
@@ -361,25 +470,31 @@ export default class RinPublisherPlugin extends Plugin {
             confirmCallback: async () => {
                 const newBaseUrl = baseUrlInput.value.trim();
                 const newUsername = usernameInput.value.trim();
-                // 1) 保存非敏感配置（不再持久化明文密码）
+                // 1) 保存非敏感配置（不再持久化明文密码），保留既有凭据引用与提示确认状态
                 this.config = {
                     baseUrl: newBaseUrl,
                     username: newUsername,
                     customPublish: customPublishInput.checked,
+                    tokenRef: this.config.tokenRef,
+                    passwordRef: this.config.passwordRef,
+                    dismissInsecureWarning: this.config.dismissInsecureWarning,
                 };
-                // 2) 若用户填写了新密码，则加密持久化（覆盖旧密码凭据）
+                // 2) 若用户填写了新密码，则持久化（覆盖旧密码凭据）
                 const newPassword = passwordInput.value.trim();
                 if (newPassword) {
-                    if (this.cryptoAvailable) {
-                        // 密码更新后旧 JWT 可能失效，先清除，由下次发布校验决定是否重登
-                        await this.removeStoredCredential(this.config.tokenRef);
-                        delete this.config.tokenRef;
-                        await this.removeStoredCredential(this.config.passwordRef);
-                        this.config.passwordRef = await this.persistCredential(newPassword);
+                    // 密码更新后旧 JWT 可能失效，先清除，由下次发布校验决定是否重登
+                    await this.removeStoredCredential(this.config.tokenRef);
+                    delete this.config.tokenRef;
+                    await this.removeStoredCredential(this.config.passwordRef);
+                    const result = await this.persistCredential(newPassword);
+                    if (result) {
+                        this.config.passwordRef = result.id;
+                        if (!result.encrypted) {
+                            // http 非 localhost 环境：明文兜底，提示用户建议使用 https
+                            showMessage(this.i18n.httpsRecommended);
+                        }
                         passwordInput.value = "";
                         passwordInput.placeholder = "••••••••";
-                    } else {
-                        showMessage(this.i18n.credentialUnavailable);
                     }
                 }
                 await this.saveData(CONFIG_KEY, this.config).catch((e) => {
@@ -541,57 +656,6 @@ export default class RinPublisherPlugin extends Plugin {
      * @param kramdown 原始 Kramdown 内容
      * @returns 清理后的干净 Markdown
      */
-    private cleanKramdown(kramdown: string): string {
-        const lines = kramdown.split("\n");
-        let inCodeBlock = false;
-        let fenceMarker = "";
-        const cleanedLines: string[] = [];
-
-        for (const line of lines) {
-            // 检测代码围栏并正确配对（按围栏类型，缩进的围栏视为代码内容而非围栏）。
-            // 未进入代码块时，围栏行必须顶格（无前导空白）才算开启，避免把缩进的代码内容误判为围栏。
-            const openingFence = !inCodeBlock ? /^(```+|~~~+)/.exec(line) : null;
-            if (openingFence) {
-                fenceMarker = openingFence[1];
-                inCodeBlock = true;
-                cleanedLines.push(line);
-                continue;
-            }
-
-            // 代码块内：用与开启围栏同类型的围栏（可带尾随空白）闭合
-            if (inCodeBlock) {
-                const closingFence = new RegExp(`^${fenceMarker[0]}+\\s*$`).exec(line);
-                if (closingFence) {
-                    inCodeBlock = false;
-                    fenceMarker = "";
-                    cleanedLines.push(line);
-                    continue;
-                }
-                // 代码块内的其他内容原样保留（其中的 {: } 可能是用户代码）
-                cleanedLines.push(line);
-                continue;
-            }
-
-            // 代码块外：删除行内 IAL 片段
-            const cleaned = line.replace(/\{:([^{}]*)\}/g, "");
-
-            // 整行仅由 IAL 组成（删除后为空但原行非空）：
-            // 用一个空行占位，避免相邻块内容粘连；若上一行已是空行则不再重复添加
-            if (cleaned.trim() === "" && line.trim() !== "") {
-                if (cleanedLines.length > 0 && cleanedLines[cleanedLines.length - 1].trim() !== "") {
-                    cleanedLines.push("");
-                }
-                continue;
-            }
-
-            // 规范化删除 IAL 后可能产生的多余空白（如 `-  内容` -> `- 内容`）
-            cleanedLines.push(cleaned.replace(/^(\s*[-*+]\s{2,})/, (m) => m.replace(/\s+$/, " ")));
-        }
-
-        // 合并多余空行，保留单个空行用于分隔
-        return cleanedLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-    }
-
     /**
      * 获取思源本地资源文件（图片）的二进制内容。
      *
@@ -652,9 +716,18 @@ export default class RinPublisherPlugin extends Plugin {
      * @param client  已登录的 Rin 客户端
      * @returns 处理结果：处理后的内容、替换映射（原图片路径 -> 新 URL）与失败统计
      */
+    /**
+     * 处理文档中的本地图片：上传到 Rin 并替换为线上 URL。
+     *
+     * @param content  文档 Markdown
+     * @param client   已认证的 Rin 客户端
+     * @param seedMap  上一次发布会话持久化的「本地路径 -> 线上 URL」映射，
+     *                 命中则跳过重复上传，直接复用既有线上 URL（解决 1.5 重复上传）
+     */
     private async processImages(
         content: string,
         client: RinClient,
+        seedMap: ReadonlyMap<string, string> = new Map(),
     ): Promise<{
         content: string;
         mapping: Map<string, string>;
@@ -669,12 +742,17 @@ export default class RinPublisherPlugin extends Plugin {
             matches.push({ alt: m[1], url: m[2].trim() });
         }
 
-        const mapping = new Map<string, string>();
+        const mapping = new Map<string, string>(seedMap);
 
-        // 收集需要上传的本地图片（跳过已是链接的）
+        // 收集需要上传的本地图片（跳过已是链接的；命中 seedMap 的也跳过，直接复用）
         const pending: Array<{ alt: string; url: string; filename: string }> = [];
         for (const img of matches) {
             if (/^(https?:\/\/|data:|blob:)/i.test(img.url)) {
+                continue;
+            }
+            const seeded = seedMap.get(img.url);
+            if (seeded) {
+                mapping.set(img.url, seeded);
                 continue;
             }
             pending.push({
@@ -713,15 +791,19 @@ export default class RinPublisherPlugin extends Plugin {
                 failed++;
                 continue;
             }
-            const pattern = /!\[([^\]]*)\]\(([^)\s]+)((?:\s+["'][^"']*["'])?)\)/g;
-            content = content.replace(pattern, (orig, alt, url, title) => {
-                if (url.trim() === r.url) {
-                    return `![${alt}](${r.newUrl}${title})`;
-                }
-                return orig;
-            });
             mapping.set(r.url.replace(/^\/+/, ""), r.newUrl);
         }
+
+        // 统一替换：对每个本地图片，若 mapping 中已有线上 URL（含本次上传或 seedMap 复用），
+        // 用带 lastIndex 的正则原位替换，保留 title。
+        const pattern = /!\[([^\]]*)\]\(([^)\s]+)((?:\s+["'][^"']*["'])?)\)/g;
+        content = content.replace(pattern, (orig, alt, url, title) => {
+            const newUrl = mapping.get(url.trim());
+            if (newUrl) {
+                return `![${alt}](${newUrl}${title})`;
+            }
+            return orig;
+        });
 
         return { content, mapping, total: matches.length, failed };
     }
@@ -741,11 +823,18 @@ export default class RinPublisherPlugin extends Plugin {
         const imgBlocks: Array<{ id: string; src: string; alt: string }> = [];
 
         const collect = async (parentId: string): Promise<void> => {
-            const resp = await this.apiPost<{ data?: Array<{ id: string; markdown?: string }> }>(
-                "/api/block/getChildBlocks",
-                { id: parentId },
-            ).catch(() => ({ data: undefined }));
-            const blocks = resp.data ?? [];
+            let blocks: Array<{ id: string; markdown?: string }> = [];
+            try {
+                const resp = await this.apiPost<{ data?: Array<{ id: string; markdown?: string }> }>(
+                    "/api/block/getChildBlocks",
+                    { id: parentId },
+                );
+                blocks = resp.data ?? [];
+            } catch (e) {
+                // 获取子块失败：跳过该节点子树，但明确告警，避免用户无感知
+                console.warn(`[rin-publisher] get child blocks fail for ${parentId}, skipping subtree:`, e);
+                return;
+            }
             await Promise.all(
                 blocks.map(async (block) => {
                     // 图片块的 markdown 字段形如：![alt](assets/xxx.png)
@@ -810,7 +899,7 @@ export default class RinPublisherPlugin extends Plugin {
             showMessage(this.i18n.getContentFailed);
             return null;
         }
-        const content = this.cleanKramdown(kramdown);
+        const content = cleanKramdown(kramdown);
 
         // 读取自定义属性（用于预填发布对话框中的默认值）
         const attrs = attrsResp.data ?? {};
@@ -873,34 +962,34 @@ export default class RinPublisherPlugin extends Plugin {
                 title: this.i18n.publishDialogTitle,
                 content: `
 <div class="b3-dialog__content">
-    <div class="b3-typography" style="margin-bottom:12px">${this.i18n.publishDialogDesc}</div>
+    <div class="b3-typography" style="margin-bottom:12px">${escapeHtml(this.i18n.publishDialogDesc)}</div>
     <div class="rin-publisher__publish">
         <div class="b3-form__item rin-publisher__publish-checkbox">
-            <label class="fn__flex b3-form__label">${this.i18n.publishDialogListed}</label>
+            <label class="fn__flex b3-form__label">${escapeHtml(this.i18n.publishDialogListed)}</label>
             <input id="rinPubListed" type="checkbox" class="b3-switch fn__flex-center" />
         </div>
         <div class="b3-form__item rin-publisher__publish-checkbox">
-            <label class="fn__flex b3-form__label">${this.i18n.publishDialogDraft}</label>
+            <label class="fn__flex b3-form__label">${escapeHtml(this.i18n.publishDialogDraft)}</label>
             <input id="rinPubDraft" type="checkbox" class="b3-switch fn__flex-center" />
         </div>
         <div class="b3-form__item">
-            <label class="fn__flex b3-form__label">${this.i18n.publishDialogAlias}</label>
-            <input id="rinPubAlias" class="b3-text-field fn__block" placeholder="${this.i18n.publishDialogAliasPh}" />
+            <label class="fn__flex b3-form__label">${escapeHtml(this.i18n.publishDialogAlias)}</label>
+            <input id="rinPubAlias" class="b3-text-field fn__block" placeholder="${escapeHtml(this.i18n.publishDialogAliasPh)}" />
         </div>
         <div class="b3-form__item">
-            <label class="fn__flex b3-form__label">${this.i18n.publishDialogTags}</label>
-            <input id="rinPubTags" class="b3-text-field fn__block" placeholder="${this.i18n.publishDialogTagsPh}" />
+            <label class="fn__flex b3-form__label">${escapeHtml(this.i18n.publishDialogTags)}</label>
+            <input id="rinPubTags" class="b3-text-field fn__block" placeholder="${escapeHtml(this.i18n.publishDialogTagsPh)}" />
         </div>
         <div class="b3-form__item">
-            <label class="fn__flex b3-form__label">${this.i18n.publishDialogSummary}</label>
-            <textarea id="rinPubSummary" class="b3-text-field fn__block" rows="3" placeholder="${this.i18n.publishDialogSummaryPh}"></textarea>
+            <label class="fn__flex b3-form__label">${escapeHtml(this.i18n.publishDialogSummary)}</label>
+            <textarea id="rinPubSummary" class="b3-text-field fn__block" rows="3" placeholder="${escapeHtml(this.i18n.publishDialogSummaryPh)}"></textarea>
         </div>
     </div>
 </div>
 <div class="b3-dialog__action">
-    <button class="b3-button b3-button--cancel">${this.i18n.cancel}</button>
+    <button class="b3-button b3-button--cancel">${escapeHtml(this.i18n.cancel)}</button>
     <div class="fn__space"></div>
-    <button class="b3-button b3-button--text">${isUpdate ? this.i18n.publishDialogUpdate : this.i18n.publishDialogSubmit}</button>
+    <button class="b3-button b3-button--text">${escapeHtml(isUpdate ? this.i18n.publishDialogUpdate : this.i18n.publishDialogSubmit)}</button>
 </div>`,
                 width: this.isMobile ? "92vw" : "560px",
             });
@@ -948,12 +1037,12 @@ export default class RinPublisherPlugin extends Plugin {
                 title: this.i18n.deletedConfirmTitle,
                 content: `
 <div class="b3-dialog__content">
-    <div class="b3-typography">${this.i18n.deletedConfirmDesc}</div>
+    <div class="b3-typography">${escapeHtml(this.i18n.deletedConfirmDesc)}</div>
 </div>
 <div class="b3-dialog__action">
-    <button class="b3-button b3-button--cancel" id="rinDelUnpublish">${this.i18n.unpublish}</button>
+    <button class="b3-button b3-button--cancel" id="rinDelUnpublish">${escapeHtml(this.i18n.unpublish)}</button>
     <div class="fn__space"></div>
-    <button class="b3-button b3-button--text" id="rinDelRepublish">${this.i18n.republish}</button>
+    <button class="b3-button b3-button--text" id="rinDelRepublish">${escapeHtml(this.i18n.republish)}</button>
 </div>`,
                 width: this.isMobile ? "92vw" : "520px",
             });
@@ -988,6 +1077,7 @@ export default class RinPublisherPlugin extends Plugin {
         const attrs: Record<string, string> = {
             [ATTR_RIN_ID]: "",
             [ATTR_RIN_URL]: "",
+            [ATTR_RIN_IMAGE_MAP]: "",
         };
         try {
             await this.apiPost<void>("/api/attr/setBlockAttrs", { id: rootId, attrs });
@@ -1007,12 +1097,12 @@ export default class RinPublisherPlugin extends Plugin {
                 title: this.i18n.unpublishConfirmTitle,
                 content: `
 <div class="b3-dialog__content">
-    <div class="b3-typography">${this.i18n.unpublishConfirmDesc}</div>
+    <div class="b3-typography">${escapeHtml(this.i18n.unpublishConfirmDesc)}</div>
 </div>
 <div class="b3-dialog__action">
-    <button class="b3-button b3-button--cancel" id="rinUnpubCancel">${this.i18n.cancel}</button>
+    <button class="b3-button b3-button--cancel" id="rinUnpubCancel">${escapeHtml(this.i18n.cancel)}</button>
     <div class="fn__space"></div>
-    <button class="b3-button b3-button--text" id="rinUnpubConfirm">${this.i18n.unpublishConfirmAction}</button>
+    <button class="b3-button b3-button--text" id="rinUnpubConfirm">${escapeHtml(this.i18n.unpublishConfirmAction)}</button>
 </div>`,
                 width: this.isMobile ? "92vw" : "520px",
             });
@@ -1031,6 +1121,47 @@ export default class RinPublisherPlugin extends Plugin {
             dialog.element.addEventListener("click", (e) => {
                 if (e.target === dialog.element) {
                     close(false);
+                }
+            });
+        });
+    }
+
+    /**
+     * 非安全环境（http 非 localhost）发布前的安全提示对话框。
+     *
+     * @returns "dismiss" 表示用户确认已了解、不再提示；"https" 表示使用 HTTPS 并清除明文配置；
+     *          null 表示用户关闭了对话框（不执行操作）
+     */
+    private showInsecureWarningDialog(): Promise<"dismiss" | "https" | null> {
+        return new Promise((resolve) => {
+            const dialog = new Dialog({
+                title: this.i18n.insecureWarningTitle,
+                content: `
+<div class="b3-dialog__content">
+    <div class="b3-typography">${escapeHtml(this.i18n.insecureWarningDesc)}</div>
+</div>
+<div class="b3-dialog__action">
+    <button class="b3-button b3-button--text" id="rinInsecureDismiss">${escapeHtml(this.i18n.insecureWarningDismiss)}</button>
+    <div class="fn__space"></div>
+    <button class="b3-button b3-button--text" id="rinInsecureHttps">${escapeHtml(this.i18n.insecureWarningUseHttps)}</button>
+</div>`,
+                width: this.isMobile ? "92vw" : "520px",
+            });
+
+            const dismissBtn = dialog.element.querySelector("#rinInsecureDismiss") as HTMLButtonElement;
+            const httpsBtn = dialog.element.querySelector("#rinInsecureHttps") as HTMLButtonElement;
+
+            const close = (result: "dismiss" | "https" | null) => {
+                dialog.destroy();
+                resolve(result);
+            };
+
+            dismissBtn.addEventListener("click", () => close("dismiss"));
+            httpsBtn.addEventListener("click", () => close("https"));
+            // 点击遮罩关闭时视为取消
+            dialog.element.addEventListener("click", (e) => {
+                if (e.target === dialog.element) {
+                    close(null);
                 }
             });
         });
@@ -1090,6 +1221,7 @@ export default class RinPublisherPlugin extends Plugin {
      */
     private async publishCurrentDoc() {
         const { baseUrl } = this.config;
+        const rootId = this.getEditorProtyle()?.block.rootID;
         if (!baseUrl) {
             showMessage(this.i18n.noConfig);
             return;
@@ -1107,14 +1239,57 @@ export default class RinPublisherPlugin extends Plugin {
             return;
         }
 
+        // 非安全环境（http 非 localhost）且用户未确认过风险时，弹窗提示
+        if (this.credentialEnv === "insecure" && !this.config.dismissInsecureWarning) {
+            const choice = await this.showInsecureWarningDialog();
+            if (choice === "https") {
+                // 使用 HTTPS 并清除明文配置：清除明文凭据 + 切换 baseUrl 到 https + 终止本次发布
+                await this.clearInsecureCredentials();
+                const httpsUrl = this.toHttpsUrl(baseUrl);
+                this.config.baseUrl = httpsUrl;
+                await this.saveData(CONFIG_KEY, this.config).catch((e) => {
+                    console.warn("[rin-publisher] save config fail:", e);
+                });
+                showMessage(this.i18n.insecureCleared);
+                return;
+            }
+            if (choice === "dismiss") {
+                // 用户确认已了解，不再提示
+                this.config.dismissInsecureWarning = true;
+                await this.saveData(CONFIG_KEY, this.config).catch((e) => {
+                    console.warn("[rin-publisher] save config fail:", e);
+                });
+            } else {
+                // 用户关闭对话框：终止本次发布
+                return;
+            }
+        }
+
         // 发布前处理文档中的本地图片：检测非链接形式的图片，
-        // 通过 Rin 上传并替换为图片链接
+        // 通过 Rin 上传并替换为图片链接。
+        // 先读取上一发布会话持久化的「本地路径 -> 线上 URL」映射作为种子，
+        // 避免「发布成功但文档块更新失败」时下次重复上传（1.5）。
         let imageMapping: Map<string, string> = new Map();
         try {
+            let seedMap: Map<string, string> = new Map();
+            if (rootId) {
+                const seedAttrs = await this.apiPost<{ data?: Record<string, string> }>(
+                    "/api/attr/getBlockAttrs",
+                    { id: rootId },
+                ).catch(() => ({ data: undefined }));
+                const raw = seedAttrs.data?.[ATTR_RIN_IMAGE_MAP];
+                if (raw) {
+                    try {
+                        seedMap = new Map(Object.entries(JSON.parse(raw) as Record<string, string>));
+                    } catch (e) {
+                        console.warn("[rin-publisher] parse image map fail:", e);
+                    }
+                }
+            }
             if (/!\[[^\]]*\]\([^)\s]+\)/.test(meta.content)) {
                 showMessage(this.i18n.uploadingImages);
             }
-            const imgResult = await this.processImages(meta.content, client);
+            const imgResult = await this.processImages(meta.content, client, seedMap);
             meta.content = imgResult.content;
             imageMapping = imgResult.mapping;
             if (imgResult.failed > 0) {
@@ -1124,7 +1299,6 @@ export default class RinPublisherPlugin extends Plugin {
             console.warn("[rin-publisher] process images fail:", e);
         }
 
-        const rootId = this.getEditorProtyle()?.block.rootID;
         let resultId: number | undefined;
         let isUpdate = false;
 
@@ -1258,6 +1432,23 @@ export default class RinPublisherPlugin extends Plugin {
                 await this.apiPost<void>("/api/attr/setBlockAttrs", { id: rootId, attrs });
             } catch (e) {
                 console.warn("[rin-publisher] save rin attrs fail:", e);
+            }
+        }
+
+        // 持久化「本地图片路径 -> 线上 URL」映射到文档属性，
+        // 使「发布成功但文档块更新失败」的场景在下次发布时不重复上传（1.5）。
+        if (rootId && imageMapping.size > 0) {
+            const imageMapObj: Record<string, string> = {};
+            for (const [k, v] of imageMapping) {
+                imageMapObj[k] = v;
+            }
+            const imageMapAttrs: Record<string, string> = {
+                [ATTR_RIN_IMAGE_MAP]: JSON.stringify(imageMapObj),
+            };
+            try {
+                await this.apiPost<void>("/api/attr/setBlockAttrs", { id: rootId, attrs: imageMapAttrs });
+            } catch (e) {
+                console.warn("[rin-publisher] save rin image map fail:", e);
             }
         }
     }
