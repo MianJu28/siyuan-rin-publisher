@@ -284,6 +284,16 @@ export class RinClient {
         }
     }
 
+    /** 手动设置已登录的 JWT（用于复用持久化的会话） */
+    setToken(token: string): void {
+        this.token = token;
+    }
+
+    /** 获取当前缓存的 JWT（可能为 null） */
+    getToken(): string | null {
+        return this.token;
+    }
+
     /** 清除缓存的 token */
     clearToken(): void {
         this.token = null;

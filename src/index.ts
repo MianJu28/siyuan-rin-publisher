@@ -10,9 +10,18 @@ import {
     Dialog,
 } from "siyuan";
 import { RinClient, RinFeedPayload } from "./rin";
+import {
+    CredentialStore,
+    emptyCredentialStore,
+    isCryptoAvailable,
+    readCredential,
+    removeCredential,
+    storeCredential,
+} from "./credential";
 import "./index.scss";
 
 const CONFIG_KEY = "rin-config";
+const CREDENTIAL_KEY = "rin-credential";
 const ATTR_RIN_ID = "custom-rin-id";
 const ATTR_RIN_URL = "custom-rin-url";
 
@@ -51,16 +60,18 @@ async function mapWithConcurrency<T, R>(
 interface RinPluginConfig {
     baseUrl: string;
     username: string;
-    password: string;
     /** 是否启用自定义发布（发布时弹出对话框让用户选择选项） */
     customPublish: boolean;
+    /** 指向 credential.json 中已持久化的 Rin JWT 的 id（方案五：优先使用） */
+    tokenRef?: string;
+    /** 指向 credential.json 中已持久化的密码密文的 id（JWT 失效时回退） */
+    passwordRef?: string;
 }
 
 function defaultConfig(): RinPluginConfig {
     return {
         baseUrl: "",
         username: "",
-        password: "",
         customPublish: true,
     };
 }
@@ -113,6 +124,9 @@ export default class RinPublisherPlugin extends Plugin {
     /** 缓存已登录的 Rin 客户端，避免每次发布/取消发布都重新登录 */
     private rinClient: RinClient | null = null;
 
+    /** 加密凭据存储（credential.json），与常规配置分离 */
+    private credentialStore: CredentialStore = emptyCredentialStore();
+
     /**
      * 获取（或创建）Rin 客户端，并在 baseUrl 变化时重建。
      * 客户端内部会缓存登录 token，减少重复登录的网络往返。
@@ -122,6 +136,108 @@ export default class RinPublisherPlugin extends Plugin {
             this.rinClient = new RinClient(baseUrl);
         }
         return this.rinClient;
+    }
+
+    /** 加密是否可用（安全上下文） */
+    private get cryptoAvailable(): boolean {
+        return isCryptoAvailable();
+    }
+
+    /**
+     * 读取持久化的明文凭据（JWT 或密码）。
+     * 非安全上下文 / 解密失败时返回 null。
+     */
+    private async readStoredCredential(id: string | undefined): Promise<string | null> {
+        if (!id || !this.cryptoAvailable) {
+            return null;
+        }
+        return readCredential(this.credentialStore, this.config.username, id);
+    }
+
+    /**
+     * 把凭据加密持久化到 credential.json，并返回其 id。
+     * 非安全上下文时返回 undefined（调用方应改用仅内存方案）。
+     */
+    private async persistCredential(plain: string): Promise<string | undefined> {
+        if (!this.cryptoAvailable) {
+            return undefined;
+        }
+        const id = await storeCredential(this.credentialStore, this.config.username, plain);
+        await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
+            console.warn("[rin-publisher] save credential fail:", e);
+        });
+        return id;
+    }
+
+    /**
+     * 移除某个持久化凭据并落盘。
+     */
+    private async removeStoredCredential(id: string | undefined): Promise<void> {
+        removeCredential(this.credentialStore, id);
+        await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
+            console.warn("[rin-publisher] save credential fail:", e);
+        });
+    }
+
+    /**
+     * 获取一个已认证的 Rin 客户端（JWT 优先，密码回退）。
+     *
+     * 流程：
+     * 1. 若有持久化 JWT（tokenRef）→ 解密并设置，再通过 getProfile 校验：
+     *    - 有效：直接复用，无需密码；
+     *    - 失效：清除 tokenRef，走密码回退。
+     * 2. 若有持久化密码（passwordRef）→ 解密并 login：
+     *    - 成功：把返回的新 JWT 加密持久化为 tokenRef（JWT 轮换）；
+     *    - 失败：返回 null。
+     *
+     * @returns 已认证的客户端；无法认证时返回 null
+     */
+    private async ensureAuthedClient(baseUrl: string): Promise<RinClient | null> {
+        const client = this.getRinClient(baseUrl);
+
+        // 优先：复用持久化 JWT
+        if (this.config.tokenRef) {
+            const jwt = await this.readStoredCredential(this.config.tokenRef);
+            if (jwt) {
+                client.setToken(jwt);
+                const profile = await client.getProfile();
+                if (!profile.error) {
+                    return client;
+                }
+                // JWT 失效：清除并回退密码
+                console.warn("[rin-publisher] stored JWT invalid, fall back to password");
+                await this.removeStoredCredential(this.config.tokenRef);
+                delete this.config.tokenRef;
+                client.clearToken();
+            } else {
+                // tokenRef 存在但无法解密（密钥变更等），移除
+                await this.removeStoredCredential(this.config.tokenRef);
+                delete this.config.tokenRef;
+            }
+        }
+
+        // 回退：使用持久化密码登录
+        if (this.config.passwordRef) {
+            const password = await this.readStoredCredential(this.config.passwordRef);
+            if (!password) {
+                console.warn("[rin-publisher] stored password not decryptable");
+                return null;
+            }
+            const login = await client.login(this.config.username, password);
+            if (!login.data?.token) {
+                console.warn("[rin-publisher] login failed:", login.error?.value);
+                return null;
+            }
+            // 登录成功：把新 JWT 加密持久化为 tokenRef，下次优先复用
+            const jwtId = await this.persistCredential(login.data.token);
+            if (jwtId) {
+                this.config.tokenRef = jwtId;
+                await this.saveData(CONFIG_KEY, this.config).catch(() => {});
+            }
+            return client;
+        }
+
+        return null;
     }
 
     /** 事件监听回调（保存引用以便卸载时移除） */
@@ -147,6 +263,15 @@ export default class RinPublisherPlugin extends Plugin {
             }
         }).catch((e) => {
             console.warn(`[${this.name}] load config fail:`, e);
+        });
+
+        // 加载加密凭据存储（与常规配置分离）
+        this.loadData(CREDENTIAL_KEY).then((store: CredentialStore | undefined) => {
+            if (store && typeof store === "object" && store.items) {
+                this.credentialStore = store;
+            }
+        }).catch((e) => {
+            console.warn(`[${this.name}] load credential fail:`, e);
         });
 
         // 构建设置面板
@@ -226,6 +351,7 @@ export default class RinPublisherPlugin extends Plugin {
         passwordInput.className = "b3-text-field fn__block";
         passwordInput.type = "password";
         passwordInput.autocomplete = "current-password";
+        passwordInput.placeholder = this.config.passwordRef ? "••••••••" : "";
 
         const customPublishInput = document.createElement("input");
         customPublishInput.type = "checkbox";
@@ -233,12 +359,29 @@ export default class RinPublisherPlugin extends Plugin {
 
         this.setting = new Setting({
             confirmCallback: async () => {
+                const newBaseUrl = baseUrlInput.value.trim();
+                const newUsername = usernameInput.value.trim();
+                // 1) 保存非敏感配置（不再持久化明文密码）
                 this.config = {
-                    baseUrl: baseUrlInput.value.trim(),
-                    username: usernameInput.value.trim(),
-                    password: passwordInput.value,
+                    baseUrl: newBaseUrl,
+                    username: newUsername,
                     customPublish: customPublishInput.checked,
                 };
+                // 2) 若用户填写了新密码，则加密持久化（覆盖旧密码凭据）
+                const newPassword = passwordInput.value.trim();
+                if (newPassword) {
+                    if (this.cryptoAvailable) {
+                        // 密码更新后旧 JWT 可能失效，先清除，由下次发布校验决定是否重登
+                        await this.removeStoredCredential(this.config.tokenRef);
+                        delete this.config.tokenRef;
+                        await this.removeStoredCredential(this.config.passwordRef);
+                        this.config.passwordRef = await this.persistCredential(newPassword);
+                        passwordInput.value = "";
+                        passwordInput.placeholder = "••••••••";
+                    } else {
+                        showMessage(this.i18n.credentialUnavailable);
+                    }
+                }
                 await this.saveData(CONFIG_KEY, this.config).catch((e) => {
                     showMessage(`[${this.name}] save config fail: ${e}`);
                 });
@@ -269,7 +412,9 @@ export default class RinPublisherPlugin extends Plugin {
             description: this.i18n.settingPasswordDesc,
             direction: "row",
             createActionElement: () => {
-                passwordInput.value = this.config.password;
+                // 密码不再明文回填；仅在已保存密码时用占位符提示
+                passwordInput.value = "";
+                passwordInput.placeholder = this.config.passwordRef ? "••••••••" : "";
                 return passwordInput;
             },
         });
@@ -332,17 +477,22 @@ export default class RinPublisherPlugin extends Plugin {
     }
 
     /**
-     * 测试与 Rin 的连接（登录）
+     * 测试与 Rin 的连接（JWT 优先，密码回退）
      */
     private async testConnection() {
-        const { baseUrl, username, password } = this.config;
-        if (!baseUrl || !username || !password) {
+        const { baseUrl, username } = this.config;
+        if (!baseUrl || !username) {
             showMessage(this.i18n.noConfig);
             return;
         }
-        const client = this.getRinClient(baseUrl);
-        const ok = await client.testConnection(username, password);
-        if (ok) {
+        const client = await this.ensureAuthedClient(baseUrl);
+        if (!client) {
+            showMessage(this.i18n.noCredential);
+            return;
+        }
+        // ensureAuthedClient 已通过 getProfile 校验 token，客户端已认证
+        const profile = await client.getProfile();
+        if (!profile.error) {
             showMessage(this.i18n.testConnectionSuccess);
         } else {
             showMessage(`${this.i18n.testConnectionFailed}：${baseUrl}`);
@@ -890,7 +1040,7 @@ export default class RinPublisherPlugin extends Plugin {
      * 取消发布：从 Rin 删除当前文档对应的文章，并清除文档中的发布相关自定义属性。
      */
     private async unpublishCurrentDoc() {
-        const { baseUrl, username, password } = this.config;
+        const { baseUrl } = this.config;
         const rootId = this.getEditorProtyle()?.block.rootID;
         if (!rootId) {
             showMessage(this.i18n.noDoc);
@@ -915,15 +1065,12 @@ export default class RinPublisherPlugin extends Plugin {
             }
         }
 
-        // 仅当确定要删除远端文章时才登录（无 rinId 时无需网络请求）
+        // 仅当确定要删除远端文章时才认证（无 rinId 时无需网络请求）
         if (hasRinId) {
-            const client = this.getRinClient(baseUrl);
-            if (username) {
-                const login = await client.login(username, password);
-                if (!login.data?.token) {
-                    showMessage(`${this.i18n.loginFailed}：${login.error?.value ?? ""}`);
-                    return;
-                }
+            const client = await this.ensureAuthedClient(baseUrl);
+            if (!client) {
+                showMessage(this.i18n.noCredential);
+                return;
             }
             showMessage(this.i18n.unpublishDeleting);
             const res = await client.deleteFeed(rinId);
@@ -942,7 +1089,7 @@ export default class RinPublisherPlugin extends Plugin {
      * 发布（或更新）当前文档到 Rin
      */
     private async publishCurrentDoc() {
-        const { baseUrl, username, password } = this.config;
+        const { baseUrl } = this.config;
         if (!baseUrl) {
             showMessage(this.i18n.noConfig);
             return;
@@ -953,14 +1100,11 @@ export default class RinPublisherPlugin extends Plugin {
             return;
         }
 
-        // 登录获取 token（复用缓存的客户端，避免重复登录）
-        const client = this.getRinClient(baseUrl);
-        if (username) {
-            const login = await client.login(username, password);
-            if (!login.data?.token) {
-                showMessage(`${this.i18n.loginFailed}：${login.error?.value ?? ""}`);
-                return;
-            }
+        // 获取已认证客户端（JWT 优先，密码回退；复用缓存避免重复登录）
+        const client = await this.ensureAuthedClient(baseUrl);
+        if (!client) {
+            showMessage(this.i18n.noCredential);
+            return;
         }
 
         // 发布前处理文档中的本地图片：检测非链接形式的图片，
