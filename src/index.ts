@@ -259,18 +259,6 @@ export default class RinPublisherPlugin extends Plugin {
     }
 
     /**
-     * 把 http 地址转换为 https 地址（保留 host 与端口，仅替换协议）。
-     * 输入非 http 时原样返回。
-     */
-    private toHttpsUrl(url: string): string {
-        const trimmed = url.trim();
-        if (/^https:\/\//i.test(trimmed)) {
-            return trimmed;
-        }
-        return trimmed.replace(/^http:\/\//i, "https://");
-    }
-
-    /**
      * 获取一个已认证的 Rin 客户端（JWT 优先，密码回退）。
      *
      * 流程：
@@ -482,6 +470,25 @@ export default class RinPublisherPlugin extends Plugin {
                 // 2) 若用户填写了新密码，则持久化（覆盖旧密码凭据）
                 const newPassword = passwordInput.value.trim();
                 if (newPassword) {
+                    // 非安全环境（http 非 localhost）且用户未确认过风险：保存密码前直接弹出安全提示
+                    if (this.credentialEnv === "insecure" && !this.config.dismissInsecureWarning) {
+                        const choice = await this.showInsecureWarningDialog();
+                        if (choice === "https") {
+                            // 清除明文配置，提示手动切换到 https；本次不保存明文密码
+                            await this.clearInsecureCredentials();
+                            showMessage(this.i18n.insecureClearedManual);
+                            passwordInput.value = "";
+                            return;
+                        }
+                        if (choice === null) {
+                            // 用户取消：不保存密码
+                            passwordInput.value = "";
+                            return;
+                        }
+                        // choice === "dismiss"：用户确认已了解，不再提示
+                        this.config.dismissInsecureWarning = true;
+                    }
+
                     // 密码更新后旧 JWT 可能失效，先清除，由下次发布校验决定是否重登
                     await this.removeStoredCredential(this.config.tokenRef);
                     delete this.config.tokenRef;
@@ -1243,14 +1250,9 @@ export default class RinPublisherPlugin extends Plugin {
         if (this.credentialEnv === "insecure" && !this.config.dismissInsecureWarning) {
             const choice = await this.showInsecureWarningDialog();
             if (choice === "https") {
-                // 使用 HTTPS 并清除明文配置：清除明文凭据 + 切换 baseUrl 到 https + 终止本次发布
+                // 使用 HTTPS 并清除明文配置：清除明文凭据 + 提示用户手动切换 https + 终止本次发布
                 await this.clearInsecureCredentials();
-                const httpsUrl = this.toHttpsUrl(baseUrl);
-                this.config.baseUrl = httpsUrl;
-                await this.saveData(CONFIG_KEY, this.config).catch((e) => {
-                    console.warn("[rin-publisher] save config fail:", e);
-                });
-                showMessage(this.i18n.insecureCleared);
+                showMessage(this.i18n.insecureClearedManual);
                 return;
             }
             if (choice === "dismiss") {

@@ -19,7 +19,7 @@
   "insecureWarningDesc": "You are accessing via http (non-localhost). Rin password and login credentials will be stored as plaintext locally. For security, please use https.",
   "insecureWarningDismiss": "I understand, stop reminding me",
   "insecureWarningUseHttps": "Use HTTPS and clear plaintext credentials",
-  "insecureCleared": "Plaintext credentials cleared and switched to https. Please log in again.",
+  "insecureClearedManual": "Plaintext credentials cleared. Please switch to https manually (e.g. change the site URL to https in settings) and log in again.",
   "sessionValidated": "Credential validated",
   "publishing": "Publishing...",
   "updating": "Updating...",

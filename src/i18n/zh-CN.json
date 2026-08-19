@@ -19,7 +19,7 @@
   "insecureWarningDesc": "当前通过 http（非 localhost）访问，Rin 密码与登录凭据将以明文保存在本地。为保障安全，建议改用 https 环境。",
   "insecureWarningDismiss": "我已了解，不再提示",
   "insecureWarningUseHttps": "使用 HTTPS 并清除明文配置",
-  "insecureCleared": "已清除明文凭据，并切换到 https 地址。请重新登录。",
+  "insecureClearedManual": "已清除明文凭据。请手动切换到 https 环境（例如在设置中把站点地址改为 https）后重新登录。",
   "sessionValidated": "凭据已通过校验",
   "publishing": "正在发布...",
   "updating": "正在更新...",
