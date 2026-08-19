@@ -18,15 +18,18 @@
 - **取消发布**：一键从 Rin 删除已发布的文章，并清除文档中的发布记录（自定义属性）。
 - **删除检测提醒**：已发布的文章在 Rin 上被删除后，再次发布会提醒选择重新发布（新建）或取消发布（清除本地记录）。
 - **复制链接**：一键复制已发布文章的访问链接。
+- **凭据加密持久化**：密码与登录凭据经 WebCrypto AES-GCM 加密后独立存储，不再明文写入插件配置；优先复用 Rin 登录 JWT，减少重复登录与密码暴露。
+- **跨环境凭据迁移**：按当前环境（安全上下文 / http 非安全）分区存储凭据；切换环境时自动回退并迁移（如从 http 切换到 https 会把明文凭据重新加密迁移到安全分区）。
+- **非安全环境安全提示**：在 http（非 localhost）环境下，保存密码或发布时会提示凭据明文存储的风险，提供「不再提示」或「使用 HTTPS 并清除明文配置」两个选项，并建议在 https 环境下使用。
 - **全平台**：基于思源官方插件 API，兼容桌面端、移动端与浏览器端。
 
 ## 安装
 
 1. 下载 `siyuan-rin-publisher-<版本号>.zip`（从 Release 或本仓库构建产物获取）。
 2. 在思源笔记中：`设置 → 集市 → 插件`，点击"导入"并选择压缩包。
-3. 启用插件，在 `插件设置` 中填写 Rin 站点地址、用户名（管理员）、密码，并按需开启"自定义发布"。
+3. 启用插件，在 `插件设置` 中填写 Rin 站点地址、用户名（管理员）、密码，并按需开启"自定义发布"。密码与登录凭据会加密保存在本地独立凭据文件中，不会明文写入插件配置。
 
-> 手动开发模式安装：将本项目克隆到 `工作空间/data/plugins/siyuan-rin-publisher`，然后执行 `npm install && npm run dev`。
+> 手动开发模式安装：将本项目克隆到 `工作空间/data/plugins/siyuan-rin-publisher`，然后执行 `pnpm install && pnpm run dev`。
 
 ## 使用
 
@@ -62,20 +65,24 @@
 | ---- | ---- |
 | Rin 站点地址 | Rin 部署地址，如 `https://your-blog.example.com` |
 | 用户名 | Rin 登录用户名（必须是管理员） |
-| 密码 | Rin 登录密码 |
+| 密码 | Rin 登录密码（加密保存到本地独立凭据文件） |
 | 自定义发布 | 开启后发布前弹出对话框，可选择公开、草稿、标签、简介与别名 |
+
+> **关于密码与凭据存储**：出于安全考虑，密码与 Rin 登录 JWT 不写入插件常规配置，而是经 AES-GCM 加密后独立存储。
+> - 在 `https://` 或 `http://localhost`（安全上下文）环境下，凭据加密存储；
+> - 在 `http://` 且非 localhost（http 非安全）环境下，WebCrypto 不可用，凭据只能明文存储。此时保存密码或发布会弹出安全提示，建议改用 https 环境。
 
 ## 开发
 
 ```bash
-# 安装依赖
-npm install
+# 安装依赖（使用 pnpm，版本见 package.json 的 packageManager）
+pnpm install
 
 # 开发模式（监听文件变化）
-npm run dev
+pnpm run dev
 
 # 生产构建（生成 dist/ 与 dist/package/siyuan-rin-publisher-<版本号>.zip）
-npm run build
+pnpm run build
 ```
 
 ### 项目结构
@@ -84,6 +91,8 @@ npm run build
 ├── src/
 │   ├── index.ts        # 插件主入口
 │   ├── rin.ts          # Rin API 客户端
+│   ├── credential.ts   # 凭据加密持久化（AES-GCM / 双环境分区）
+│   ├── kramdown.ts     # Kramdown 清理（纯函数）
 │   ├── index.scss      # 样式
 │   └── i18n/           # 国际化
 ├── .github/workflows/  # GitHub Actions（构建并发布 Release）
@@ -97,22 +106,24 @@ npm run build
 1. 通过监听 `switch-protyle` / `click-editorcontent` 事件维护当前激活的文档，确保多标签场景下始终操作正确文档。
 2. 通过思源内核 API `getBlockInfo` 获取文档标题（`rootTitle`）。
 3. 通过 `getBlockKramdown` 获取当前文档的 Markdown（Kramdown）内容，并自动清理思源块级 IAL 元数据（形如 `{: id="..." updated="..."}` 的属性行），保证发布的是干净的 Markdown。
-4. 读取文档自定义属性，解析标签、别名、创建时间。
-5. **图片处理**：扫描 Markdown 中的本地图片（`assets/...`），并发读取并上传到 Rin（`POST /api/storage`），将发布内容中的图片替换为线上链接，并记录替换映射。
-6. 调用 Rin `/api/auth/login` 登录获取 JWT。
+4. 读取文档自定义属性，解析标签、别名、创建时间，以及上一次发布会话持久化的「本地图片 → 线上 URL」映射（避免重复上传）。
+5. **图片处理**：扫描 Markdown 中的本地图片（`assets/...`），限并发读取并上传到 Rin（`POST /api/storage`），将发布内容中的图片替换为线上链接，并记录替换映射；命中已持久化映射的图片直接复用线上链接。
+6. **认证**：优先复用持久化的 Rin JWT（`getProfile` 校验，有效则直接使用）；JWT 失效或缺失时回退用密码调用 `/api/auth/login` 登录，登录成功后把新 JWT 加密持久化，下次优先复用。
 7. 调用 `/api/feed` 创建文章或 `/api/feed/:id` 更新文章。
 8. **删除检测**：发布前校验 `custom-rin-id` 对应的文章在 Rin 上是否仍存在；若已删除（404），弹出提醒让用户选择重新发布或取消发布。
-9. **文档同步**：发布成功后，通过 `getChildBlocks` 遍历文档图片块，将本地图片替换为上传后的线上链接。
+9. **文档同步**：发布成功后，通过 `getChildBlocks` 遍历文档图片块，将本地图片替换为上传后的线上链接，并把「本地路径 → 线上 URL」映射持久化到文档自定义属性。
 10. 将 Rin 文章 ID / 链接写回文档自定义属性。
 11. **取消发布**：通过 `/api/feed/:id`（DELETE）从 Rin 删除文章，并清除文档中的发布相关自定义属性。
 
+> **凭据存储**：密码与 JWT 经 AES-GCM（PBKDF2 派生密钥）加密后独立存储于插件数据目录，与常规配置分离。凭据按环境分区：安全上下文（https / localhost）存加密条目，http 非安全环境存明文；切换环境时自动回退并迁移。在 http 非安全环境下保存密码或发布时，会弹出安全提示建议使用 https。
+
 ## 发布（Release）
 
-本项目配置了 GitHub Actions 工作流（`.github/workflows/release.yml`），推送 `v*` 格式的 tag 会自动构建插件并发布 GitHub Release：
+本项目配置了 GitHub Actions 工作流（`.github/workflows/release.yml`），推送 `v*` 格式的 tag 会自动构建插件并发布 GitHub Release。CI 使用 **Node 24 + pnpm** 安装依赖并构建：
 
 ```bash
-git tag v0.3.4
-git push origin v0.3.4
+git tag v0.4.3
+git push origin v0.4.3
 ```
 
 ## License
