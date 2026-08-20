@@ -14,6 +14,7 @@ import { cleanKramdown } from "./kramdown";
 import {
     CredentialStore,
     Environment,
+    cleanupOrphanCredentials,
     emptyCredentialStore,
     getEnvironment,
     normalizeCredentialStore,
@@ -244,18 +245,45 @@ export default class RinPublisherPlugin extends Plugin {
     /**
      * 清除所有明文凭据（insecure 分区）及配置中对它们的引用。
      * 用于「使用 HTTPS 并清除明文配置」选项，避免明文继续残留。
+     *
+     * @returns 是否清除了当前环境正在使用的凭据。
+     *          true 表示当前环境为 insecure（当前凭据被清除，需要重新登录）；
+     *          false 表示仅清除了历史明文凭据（如安全环境下清理遗留明文，当前凭据仍有效）。
      */
-    private async clearInsecureCredentials(): Promise<void> {
+    private async clearInsecureCredentials(): Promise<boolean> {
         // 清空 insecure 分区
         this.credentialStore.insecure = {};
         // 若配置引用指向 insecure 分区（当前环境即 insecure），一并清除引用
-        if (this.credentialEnv === "insecure") {
+        const affected = this.credentialEnv === "insecure";
+        if (affected) {
             delete this.config.tokenRef;
             delete this.config.passwordRef;
         }
         await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
             console.warn("[rin-publisher] save credential fail:", e);
         });
+        return affected;
+    }
+
+    /**
+     * 清理凭据存储中未被任何配置引用的孤立条目。
+     * 只在被引用的凭据（tokenRef / passwordRef）之外做清理，
+     * 避免因跨环境切换、历史保存等产生的残留配置长期占用。
+     */
+    private async cleanupOrphanCredentials(): Promise<void> {
+        const referenced = new Set<string>();
+        if (this.config.tokenRef) {
+            referenced.add(this.config.tokenRef);
+        }
+        if (this.config.passwordRef) {
+            referenced.add(this.config.passwordRef);
+        }
+        const removed = cleanupOrphanCredentials(this.credentialStore, referenced);
+        if (removed) {
+            await this.saveData(CREDENTIAL_KEY, this.credentialStore).catch((e) => {
+                console.warn("[rin-publisher] save credential fail:", e);
+            });
+        }
     }
 
     /**
@@ -504,6 +532,8 @@ export default class RinPublisherPlugin extends Plugin {
                         passwordInput.placeholder = "••••••••";
                     }
                 }
+                // 3) 清理凭据存储中未被引用的残留条目（如跨环境切换后遗留的旧凭据）
+                await this.cleanupOrphanCredentials();
                 await this.saveData(CONFIG_KEY, this.config).catch((e) => {
                     showMessage(`[${this.name}] save config fail: ${e}`);
                 });
@@ -548,6 +578,24 @@ export default class RinPublisherPlugin extends Plugin {
                 customPublishInput.checked = this.config.customPublish;
                 return customPublishInput;
             },
+        });
+        // 清除不安全设置（http 非安全环境下以明文保存的凭据）
+        const clearInsecureBtn = document.createElement("button");
+        clearInsecureBtn.className = "b3-button";
+        clearInsecureBtn.textContent = this.i18n.clearInsecureSettings;
+        clearInsecureBtn.addEventListener("click", async () => {
+            const affected = await this.clearInsecureCredentials();
+            await this.saveData(CONFIG_KEY, this.config).catch((e) => {
+                console.warn("[rin-publisher] save config fail:", e);
+            });
+            // 安全环境下清除的是历史明文凭据，当前 secure 凭据仍有效，无需重新登录
+            showMessage(affected ? this.i18n.clearInsecureSettingsDone : this.i18n.clearInsecureSettingsDoneSecure);
+        });
+        this.setting.addItem({
+            title: this.i18n.clearInsecureSettings,
+            description: this.i18n.clearInsecureSettingsDesc,
+            direction: "row",
+            createActionElement: () => clearInsecureBtn,
         });
     }
 

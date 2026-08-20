@@ -248,3 +248,28 @@ export function removeCredential(store: CredentialStore, id: string | undefined,
         delete store.insecure[id];
     }
 }
+
+/**
+ * 清理两个分区中未被引用的孤立凭据条目。
+ * 只保留 referencedIds 集合中的凭据，其余视为残留（如跨环境切换后遗留的历史条目）。
+ *
+ * @returns 是否清理了至少一个条目
+ */
+export function cleanupOrphanCredentials(store: CredentialStore, referencedIds: Set<string>): boolean {
+    let removed = false;
+    // secure 分区
+    for (const id of Object.keys(store.secure)) {
+        if (!referencedIds.has(id)) {
+            delete store.secure[id];
+            removed = true;
+        }
+    }
+    // insecure 分区
+    for (const id of Object.keys(store.insecure)) {
+        if (!referencedIds.has(id)) {
+            delete store.insecure[id];
+            removed = true;
+        }
+    }
+    return removed;
+}
